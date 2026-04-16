@@ -1,5 +1,6 @@
 import type { DataProviderName } from "@morpho-blue-liquidation-bot/config";
 
+import { AaveV3DataProvider } from "./aaveV3/index.js";
 import type { DataProvider } from "./dataProvider";
 import { HyperIndexDataProvider } from "./hyperIndex";
 import { MorphoApiDataProvider } from "./morphoApi";
@@ -21,6 +22,9 @@ export async function createDataProviders(
       break;
     case "hyperIndex":
       provider = new HyperIndexDataProvider();
+      break;
+    case "aaveV3":
+      provider = new AaveV3DataProvider();
       break;
     default:
       throw new Error(`Unknown data provider: ${dataProviderName}`);
