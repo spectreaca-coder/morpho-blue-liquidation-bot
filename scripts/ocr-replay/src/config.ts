@@ -115,8 +115,11 @@ export const POOLS: PoolConfig[] = [
     token1Decimals: 18,
     feePpm: 100,
     feedSymbol: "wstETH/ETH",
-    // price = sqrtPrice^2 → token1(wstETH) per token0(WETH) ≈ ~1.16
-    quoteIsToken0: false,
+    // Oracle wstETH/ETH returns ETH-per-wstETH ≈ 1.24 (token0-per-token1 = WETH/wstETH).
+    // Raw pool price: token1/token0 = wstETH/WETH ≈ 0.812.
+    // pool-state.ts inverts when quoteIsToken0=true → impliedPrice = 1/0.812 ≈ 1.231 (WETH-per-wstETH).
+    // profit-calc compares oracle 1.24 vs impliedPrice 1.231 directly (same unit). ✓
+    quoteIsToken0: true,
   },
   {
     symbol: "cbETH/WETH UniV3 500",
@@ -141,7 +144,8 @@ export const POOLS: PoolConfig[] = [
     token1: USDC,
     token0Decimals: 18,
     token1Decimals: 6,
-    feePpm: 100, // Aerodrome CL tickSpacing=100 corresponds to ~0.01% fee tier
+    // Real fee verified via cast call <pool> "fee()(uint24)" --rpc-url https://base.drpc.org → 568
+    feePpm: 568,
     feedSymbol: "ETH/USD",
     quoteIsToken0: false,
   },
@@ -154,7 +158,8 @@ export const POOLS: PoolConfig[] = [
     token1: cbBTC,
     token0Decimals: 6,
     token1Decimals: 8,
-    feePpm: 100,
+    // Real fee verified via cast call <pool> "fee()(uint24)" --rpc-url https://base.drpc.org → 306
+    feePpm: 306,
     feedSymbol: "cbBTC/USD",
     quoteIsToken0: true,
   },
