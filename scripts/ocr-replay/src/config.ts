@@ -40,7 +40,16 @@ export const FEEDS: OracleFeed[] = [
 // Pools are finalised in Task 4. Empty for now.
 export const POOLS: PoolConfig[] = [];
 
-export const BASE_RPC_URL = process.env.BASE_ARCHIVE_RPC_URL ?? process.env.RPC_URL_1 ?? "";
+const _rpcUrl =
+  process.env.BASE_ARCHIVE_RPC_URL ?? process.env.BASE_RPC_URL_HTTP ?? "https://base.drpc.org";
+
+if (!_rpcUrl) {
+  throw new Error(
+    "BASE_RPC_URL is empty after all fallbacks (BASE_ARCHIVE_RPC_URL, BASE_RPC_URL_HTTP, drpc.org)",
+  );
+}
+
+export const BASE_RPC_URL = _rpcUrl;
 export const REPLAY_DAYS = 14;
 export const GAS_LIMIT_LIQUIDATION = 250_000n;
 export const MIN_PROFIT_USD = 0.5;
