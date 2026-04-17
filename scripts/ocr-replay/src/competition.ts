@@ -73,6 +73,8 @@ interface CsvRow {
   oracle: string;
   pool: string;
   deviationBps: number;
+  /** Signed deviation bps (Finding 2). 0 when reading legacy CSV without this column. */
+  deviationBpsSigned: number;
   netConservative: number;
   netOptimistic: number;
 }
@@ -138,12 +140,18 @@ async function loadTop50(): Promise<CsvRow[]> {
     // Only include rows that are actually profitable.
     if (netConservative <= 0) continue;
 
+    // Column 11 (deviationBpsSigned) was appended in the Finding 2 fix. Older
+    // CSVs without this column fall back to 0 → behavior matches pre-fix
+    // (constant per-pool arbDir via getArbDirectionToken0In).
+    const deviationBpsSigned = parts.length >= 12 ? parseFloat(parts[11]) : 0;
+
     rows.push({
       block: BigInt(parts[0]),
       txHash: parts[1],
       oracle: parts[2],
       pool: parts[3],
       deviationBps: parseFloat(parts[4]),
+      deviationBpsSigned,
       netConservative,
       netOptimistic: parseFloat(parts[10]),
     });
@@ -176,10 +184,23 @@ function findPool(poolSymbol: string): PoolConfig | undefined {
  *   when oracle rises, token1 value relative to token0 increases → sell token1 buy token0.
  *   → amount0 < 0 → token0In=false.
  */
-function getArbDirectionToken0In(pool: PoolConfig): boolean {
-  // quoteIsToken0=false → arb direction is token0In (sell token0, buy token1 from pool)
-  // quoteIsToken0=true  → arb direction is token1In (sell token1, buy token0 from pool)
-  return !pool.quoteIsToken0;
+function getArbDirectionToken0In(pool: PoolConfig, deviationBpsSigned = 0): boolean {
+  // Finding 2 fix: arb direction depends on BOTH pool orientation AND the sign of
+  // the oracle-vs-pool deviation. When deviation > 0 (oracle says the non-quote
+  // asset is worth more than the pool), the arb buys from the pool; when < 0,
+  // the arb sells to the pool — the opposite token0In.
+  //
+  // Truth table (verified against existing doc comments):
+  //   quoteIsToken0=false, dev>0 → token0In=true  (send token0 in, receive token1)
+  //   quoteIsToken0=false, dev<0 → token0In=false
+  //   quoteIsToken0=true,  dev>0 → token0In=false
+  //   quoteIsToken0=true,  dev<0 → token0In=true
+  //
+  // Equivalent: token0In = (dev > 0) !== quoteIsToken0
+  // Fallback when deviationBpsSigned===0 (legacy CSV): assume dev>0 → original
+  // constant `!quoteIsToken0` behavior preserved.
+  const devPositive = deviationBpsSigned >= 0;
+  return devPositive !== pool.quoteIsToken0;
 }
 
 // ─── getLogs with retry ───────────────────────────────────────────────────────
@@ -346,7 +367,7 @@ async function main(): Promise<void> {
     const toBlock = row.block + BigInt(SEARCH_WINDOW);
     const swaps = await getSwapLogs(pool.address, fromBlock, toBlock);
 
-    const arbDir = getArbDirectionToken0In(pool);
+    const arbDir = getArbDirectionToken0In(pool, row.deviationBpsSigned);
     const noSwapAtAll = swaps.length === 0;
 
     // Find competitor swaps: same arb direction within the window.

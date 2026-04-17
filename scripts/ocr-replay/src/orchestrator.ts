@@ -232,6 +232,7 @@ interface SerializedRow {
   liquidity: string;
   impliedPrice: number;
   deviationBps: number;
+  deviationBpsSigned?: number;
   swapAmountUsd: number;
   gross: number;
   flashloanFee: number;
@@ -257,6 +258,7 @@ function serializeRow(row: ProfitRow): SerializedRow {
     liquidity: row.stateBefore.liquidity.toString(),
     impliedPrice: row.stateBefore.impliedPrice,
     deviationBps: row.deviationBps,
+    deviationBpsSigned: row.deviationBpsSigned,
     swapAmountUsd: row.swapAmountUsd,
     gross: row.gross,
     flashloanFee: row.flashloanFee,
@@ -291,6 +293,8 @@ function deserializeRow(s: SerializedRow): ProfitRow {
       impliedPrice: s.impliedPrice,
     },
     deviationBps: s.deviationBps,
+    // Legacy checkpoint files may not have deviationBpsSigned; default 0.
+    deviationBpsSigned: s.deviationBpsSigned ?? 0,
     swapAmountUsd: s.swapAmountUsd,
     gross: s.gross,
     flashloanFee: s.flashloanFee,
@@ -339,8 +343,10 @@ async function loadPartial(): Promise<PartialCheckpoint> {
 
 // ─── CSV serialization ────────────────────────────────────────────────────────
 
+// NOTE: appended deviationBpsSigned at the end to preserve column indices for
+// existing readers (competition.ts / report.ts parse by index). Finding 2 fix.
 const CSV_HEADER =
-  "block,txHash,oracle,pool,deviationBps,swapUsd,gross,dexFee,gasUsd,netConservative,netOptimistic";
+  "block,txHash,oracle,pool,deviationBps,swapUsd,gross,dexFee,gasUsd,netConservative,netOptimistic,deviationBpsSigned";
 
 function rowToCsv(row: ProfitRow): string {
   const e = row.event;
@@ -357,6 +363,7 @@ function rowToCsv(row: ProfitRow): string {
     row.gasUsd.toFixed(4),
     row.netConservative.toFixed(4),
     row.netOptimistic.toFixed(4),
+    row.deviationBpsSigned.toFixed(2),
   ].join(",");
 }
 

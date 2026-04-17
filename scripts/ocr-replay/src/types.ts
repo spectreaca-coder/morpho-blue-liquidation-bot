@@ -42,6 +42,12 @@ export interface ProfitRow {
   pool: PoolConfig;
   stateBefore: PoolState;
   deviationBps: number;
+  /**
+   * Signed deviation in bps (positive = oracle > pool → buy FROM pool;
+   * negative = oracle < pool → sell TO pool). Used by the competition
+   * analyzer to pick the correct per-row arb direction (reviewer Finding 2).
+   */
+  deviationBpsSigned: number;
   swapAmountUsd: number;
   gross: number;
   flashloanFee: number;

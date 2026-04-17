@@ -149,8 +149,16 @@ export namespace Flashbots {
     }
 
     const result = responseBody.result;
+    // Finding 4 fix (ultrareview): isSimulated + isHighPriority only confirm the RELAY
+    // accepted the bundle with priority — they do NOT confirm on-chain inclusion.
+    // A bundle can be simulated with high priority and still lose the block race.
+    // Use `sealedByBuildersAt` (non-empty ⇒ at least one builder actually sealed the
+    // bundle into a block) as the stronger on-chain inclusion proxy. Documented at
+    // https://docs.flashbots.net/flashbots-auction/advanced/rpc-endpoint#flashbots_getbundlestatsv2
+    const sealedByBuilders: unknown = result?.sealedByBuildersAt;
+    const isSealed = Array.isArray(sealedByBuilders) && sealedByBuilders.length > 0;
     return {
-      isIncluded: result?.isSimulated === true && result?.isHighPriority === true,
+      isIncluded: isSealed,
       isHighPriority: result?.isHighPriority ?? false,
       simulatedAt: result?.simulatedAt,
     };

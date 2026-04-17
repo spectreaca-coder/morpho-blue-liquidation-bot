@@ -95,12 +95,15 @@ export function computeProfit(
   const deviation = (oraclePrice - poolPrice) / poolPrice;
   const absDev = Math.abs(deviation);
   const deviationBps = absDev * 10_000;
+  // Signed version preserves direction so competition.ts can pick per-row
+  // arb direction via XOR(quoteIsToken0, deviationSign < 0) (Finding 2 fix).
+  const deviationBpsSigned = deviation * 10_000;
 
   // ─── Threshold gate: must exceed 1.5× fee tier ────────────────────────────
   // Below this threshold, the round-trip fee would consume the entire profit.
   const feeFraction = pool.feePpm / 1_000_000;
   if (absDev < feeFraction * 1.5) {
-    return buildZeroRow(event, pool, state, deviationBps);
+    return buildZeroRow(event, pool, state, deviationBps, deviationBpsSigned);
   }
 
   // ─── Depth estimation ─────────────────────────────────────────────────────
@@ -121,7 +124,7 @@ export function computeProfit(
   const swapAmountUsd = Math.min(uncappedSwap, MAX_SWAP_USD);
 
   if (!isFinite(swapAmountUsd) || swapAmountUsd <= 0) {
-    return buildZeroRow(event, pool, state, deviationBps);
+    return buildZeroRow(event, pool, state, deviationBps, deviationBpsSigned);
   }
 
   // ─── Gross profit = swap × deviation × 0.5 (midpoint price impact) ────────
@@ -129,7 +132,7 @@ export function computeProfit(
   const gross = swapAmountUsd * absDev * 0.5;
 
   if (!isFinite(gross)) {
-    return buildZeroRow(event, pool, state, deviationBps);
+    return buildZeroRow(event, pool, state, deviationBps, deviationBpsSigned);
   }
 
   // ─── Cost calculation ─────────────────────────────────────────────────────
@@ -153,6 +156,7 @@ export function computeProfit(
     pool,
     stateBefore: state,
     deviationBps,
+    deviationBpsSigned,
     swapAmountUsd,
     gross,
     flashloanFee,
@@ -178,12 +182,14 @@ function buildZeroRow(
   pool: PoolConfig,
   state: PoolState,
   deviationBps: number,
+  deviationBpsSigned = 0,
 ): ProfitRow {
   return {
     event,
     pool,
     stateBefore: state,
     deviationBps,
+    deviationBpsSigned,
     swapAmountUsd: 0,
     gross: 0,
     flashloanFee: 0,

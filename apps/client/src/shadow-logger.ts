@@ -239,16 +239,17 @@ export class ShadowLogger {
         },
       ],
     });
+    // viem's log type has blockNumber/transactionIndex/logIndex as `Hex | null` for
+    // pending logs; we only sort sealed logs so null should not occur, but narrow
+    // the type explicitly to satisfy strict TS (hexToBigInt expects `Hex | undefined`).
+    const toBig = (h: `0x${string}` | null | undefined): bigint =>
+      h == null ? 0n : (hexToBigInt(h) ?? 0n);
     const logs = [...rawLogs].sort((left, right) => {
-      const blockDiff = Number(
-        (hexToBigInt(left.blockNumber) ?? 0n) - (hexToBigInt(right.blockNumber) ?? 0n),
-      );
+      const blockDiff = Number(toBig(left.blockNumber) - toBig(right.blockNumber));
       if (blockDiff !== 0) return blockDiff;
-      const txIndexDiff = Number(
-        (hexToBigInt(left.transactionIndex) ?? 0n) - (hexToBigInt(right.transactionIndex) ?? 0n),
-      );
+      const txIndexDiff = Number(toBig(left.transactionIndex) - toBig(right.transactionIndex));
       if (txIndexDiff !== 0) return txIndexDiff;
-      return Number((hexToBigInt(left.logIndex) ?? 0n) - (hexToBigInt(right.logIndex) ?? 0n));
+      return Number(toBig(left.logIndex) - toBig(right.logIndex));
     });
 
     const ourTipGwei = toGwei(attempt.ourTipWei);
