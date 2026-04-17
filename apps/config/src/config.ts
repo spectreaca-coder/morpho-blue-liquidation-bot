@@ -60,7 +60,6 @@ export const chainConfigs: Record<number, Config> = {
         "0x214c2bf3c899c913efda9c4a49adff23f77bbc2dc525af7c05be7ec93f32d561", // wrsETH/WETH — UniswapV3 3000 fee tier (1 wrsETH = 1.06 WETH)
         "0x9103c3b4e834476c9a62ea009ba2c884ee42e94e6e314a26f04d312434191836", // cbBTC/USDC (main market)
         "0x1c21c59df9db44bf6f645d854ee710a8ca17b479451447e9f56758aee10a2fad", // cbETH/USDC
-        "0x3b3769cfca57be2eaed03fcc5299c25691b77781a1e124e7a8d520eb9a7eabb5", // USDC/WETH reverse market (USDC collateral, WETH loan) — 7 liq/14d, $9.6K borrow
       ],
       liquidityVenues: [
         "erc20Wrapper",
