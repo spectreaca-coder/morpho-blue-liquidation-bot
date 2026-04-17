@@ -107,6 +107,18 @@ export class LiquidationBot {
   private primaryWalletCoordinator: PrimaryWalletCoordinator;
   private canary?: CanaryTracker;
 
+  /**
+   * Shared gas-price cache across all liquidate()/preLiquidate() calls in a
+   * single run() tick. Without this, a 147-position Promise.all spawns 147
+   * parallel eth_gasPrice RPC calls, which public RPCs (esp. Arbitrum public
+   * arb1.arbitrum.io) rate-limit into 42+ HttpRequestError fanouts. Keep TTL
+   * short (5s) so we still adapt to price changes between cycles. Shared
+   * in-flight promise prevents thundering-herd refetch on cold cache.
+   */
+  private cachedGasPrice: { value: bigint; fetchedAt: number } | null = null;
+  private gasPriceInFlight: Promise<bigint> | null = null;
+  private static readonly GAS_PRICE_CACHE_TTL_MS = 5_000;
+
   constructor(inputs: LiquidationBotInputs) {
     this.logTag = inputs.logTag;
     this.chainId = inputs.chainId;
@@ -756,7 +768,7 @@ export class LiquidationBot {
           },
         ],
       }),
-      getGasPrice(this.client),
+      this.getCachedGasPrice(),
     ]);
 
     if (results[1].status !== "success") {
@@ -1033,6 +1045,34 @@ export class LiquidationBot {
     const ethUsdScaled = await this.getEthUsdPriceScaled();
     const usdScaled = (amountWei * ethUsdScaled) / WAD;
     return Number(usdScaled) / Number(USD_SCALE);
+  }
+
+  /**
+   * Fetch gas price with short-lived cache + single-flight deduplication.
+   * Called per-position during liquidate()/preLiquidate(); on a 147-position
+   * Promise.all tick this collapses to a single eth_gasPrice RPC call (plus
+   * one refresh every ~5s). Eliminates the rate-limit cascade observed on
+   * Arbitrum public RPC (42-fanout HttpRequestError loop, OCI Apr 17).
+   */
+  private async getCachedGasPrice(): Promise<bigint> {
+    const now = Date.now();
+    const cached = this.cachedGasPrice;
+    if (cached !== null && now - cached.fetchedAt < LiquidationBot.GAS_PRICE_CACHE_TTL_MS) {
+      return cached.value;
+    }
+    // In-flight dedup: if a peer is already fetching, await its promise.
+    if (this.gasPriceInFlight !== null) {
+      return this.gasPriceInFlight;
+    }
+    this.gasPriceInFlight = getGasPrice(this.client)
+      .then((value) => {
+        this.cachedGasPrice = { value, fetchedAt: Date.now() };
+        return value;
+      })
+      .finally(() => {
+        this.gasPriceInFlight = null;
+      });
+    return this.gasPriceInFlight;
   }
 
   private markPositionUsed(marketId: Hex, account: Address) {
