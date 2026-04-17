@@ -154,6 +154,18 @@ describe("ShadowLogger", () => {
     await vi.advanceTimersByTimeAsync(25);
     await flushAsyncWork();
 
+    // Finding 8 regression guard: eth_getLogs must filter by marketId at topic1
+    // to avoid cross-market contamination when the same borrower is liquidated
+    // in a different pool within the enrichment window.
+    const getLogsCall = wonClient.request.mock.calls.find(
+      (c) => (c[0] as { method: string }).method === "eth_getLogs",
+    );
+    expect(getLogsCall).toBeDefined();
+    const filter = (getLogsCall![0] as { params: [{ topics: unknown[] }] }).params[0];
+    expect(filter.topics[1]).toBe(
+      "0x1111111111111111111111111111111111111111111111111111111111111111",
+    );
+
     const wonLines = await waitForLineCount(wonPath, 2);
     expect(wonLines[1]).toMatchObject({
       type: "shadow_outcome",

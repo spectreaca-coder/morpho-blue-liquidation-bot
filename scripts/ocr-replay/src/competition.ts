@@ -24,8 +24,12 @@ import type { PoolConfig } from "./types.js";
 
 // ─── RPC ─────────────────────────────────────────────────────────────────────
 
-const RPC_URL =
-  process.env.BASE_ARCHIVE_RPC_URL ?? "https://base-mainnet.g.alchemy.com/v2/zp-Jw7nTJ9HkNvJHiEAK2";
+const RPC_URL = process.env.BASE_ARCHIVE_RPC_URL;
+if (!RPC_URL) {
+  throw new Error(
+    "BASE_ARCHIVE_RPC_URL is required. Set it in .env before running the competition analyzer.",
+  );
+}
 
 const client = createPublicClient({
   chain: base,

@@ -225,6 +225,9 @@ export class ShadowLogger {
     const currentBlock = await this.publicClient.getBlockNumber();
     const fromBlock = attempt.ourSentBlock > 3n ? attempt.ourSentBlock - 3n : 0n;
     const borrowerTopic = toBorrowerTopic(attempt.borrower);
+    // Finding 8 fix: filter by marketId at topic1 so a cross-market liquidation
+    // of the same borrower in a different pool is not mis-attributed as our winner.
+    // Morpho Liquidate event: topics = [sig, indexed id, indexed caller, indexed borrower]
     const rawLogs = await this.publicClient.request({
       method: "eth_getLogs",
       params: [
@@ -232,7 +235,7 @@ export class ShadowLogger {
           address: this.morphoAddress,
           fromBlock: toHexBlock(fromBlock),
           toBlock: toHexBlock(currentBlock),
-          topics: [LIQUIDATE_TOPIC0, null, null, borrowerTopic],
+          topics: [LIQUIDATE_TOPIC0, attempt.marketId, null, borrowerTopic],
         },
       ],
     });
