@@ -188,16 +188,32 @@ export class UniswapV3Venue implements LiquidityVenue {
     try {
       const newPools = (
         await Promise.all(
-          FEE_TIERS.map(async (fee) =>
-            readContract(encoder.client, {
+          FEE_TIERS.map(async (fee) => {
+            const pool = await readContract(encoder.client, {
               address: factoryAddress,
               abi: uniswapV3FactoryAbi,
               functionName: "getPool",
               args: [src, dst, fee],
-            }),
-          ),
+            });
+            if (pool === zeroAddress) return null;
+
+            // Filter ghost pools (zero liquidity) and warm convert()'s TTL cache.
+            try {
+              const liquidity = await readContract(encoder.client, {
+                address: pool,
+                abi: uniswapV3PoolAbi,
+                functionName: "liquidity",
+              });
+              if (liquidity === 0n) return null;
+              this.liquidityCache.set(pool, { amount: liquidity, fetchedAt: Date.now() });
+            } catch {
+              return null;
+            }
+
+            return pool;
+          }),
         )
-      ).filter((pool) => pool !== zeroAddress);
+      ).filter((pool): pool is Address => pool !== null);
 
       if (this.pools[src]?.[dst] === undefined) {
         this.pools[src] = { ...this.pools[src], [dst]: newPools };

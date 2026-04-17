@@ -378,7 +378,15 @@ export class FlashblockHandler {
       const candidates = nearLiquidation.slice(0, 10).filter((c) => {
         const key = `${c.position.borrower.toLowerCase()}:${c.position.marketId}`;
         if (this.inFlightBorrowers.has(key)) return false;
-        if (this.inFlightBorrowers.size > 100) this.inFlightBorrowers.clear();
+        const MAX_IN_FLIGHT = 100;
+        const EVICT_TARGET = 50;
+        if (this.inFlightBorrowers.size > MAX_IN_FLIGHT) {
+          const toEvict = Array.from(this.inFlightBorrowers).slice(
+            0,
+            this.inFlightBorrowers.size - EVICT_TARGET,
+          );
+          for (const k of toEvict) this.inFlightBorrowers.delete(k);
+        }
         this.inFlightBorrowers.add(key);
         return true;
       });
@@ -951,7 +959,12 @@ export class FlashblockHandler {
     const gasUsed = receipt.gasUsed;
     const effectiveGasPrice = receipt.effectiveGasPrice ?? 0n;
     const gasCostWei = gasUsed * effectiveGasPrice;
-    const gasCostUsd = (Number(gasCostWei) / 1e18) * 2500;
+    let gasCostUsd: number;
+    try {
+      gasCostUsd = await this.bot.usdValueFromEthAmount(gasCostWei);
+    } catch {
+      gasCostUsd = (Number(gasCostWei) / 1e18) * 3500;
+    }
     const isSuccess = receipt.status === "success";
     this.canary.recordResult({
       timestamp: nowMs,

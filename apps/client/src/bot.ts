@@ -44,6 +44,7 @@ import {
   type PrimaryWalletCoordinator,
   type PrimaryWalletLease,
 } from "./primary-wallet-coordinator";
+import type { ShadowLogger } from "./shadow-logger";
 import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
@@ -79,6 +80,7 @@ export interface LiquidationBotInputs {
   flashbotAccount?: LocalAccount;
   tipBps?: bigint;
   primaryWalletCoordinator: PrimaryWalletCoordinator;
+  shadowLogger?: ShadowLogger;
   /** Phase 2 canary gate. Optional; when absent, all attempts pass through. */
   canary?: CanaryTracker;
 }
@@ -105,7 +107,9 @@ export class LiquidationBot {
   private alwaysRealizeBadDebt: boolean;
   private multiBuilder?: MultiBuilderSubmitter;
   private primaryWalletCoordinator: PrimaryWalletCoordinator;
+  private shadowLogger?: ShadowLogger;
   private canary?: CanaryTracker;
+  private isRunning = false;
 
   /**
    * Shared gas-price cache across all liquidate()/preLiquidate() calls in a
@@ -140,6 +144,7 @@ export class LiquidationBot {
     this.coveredMarkets = [];
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt;
     this.primaryWalletCoordinator = inputs.primaryWalletCoordinator;
+    this.shadowLogger = inputs.shadowLogger;
     this.canary = inputs.canary;
     if (inputs.flashbotAccount) {
       this.multiBuilder = new MultiBuilderSubmitter(inputs.flashbotAccount);
@@ -147,15 +152,19 @@ export class LiquidationBot {
   }
 
   async run() {
-    await this.fetchMarkets();
-
-    const { liquidatablePositions, preLiquidatablePositions } =
-      await this.dataProvider.fetchLiquidatablePositions(this.client, this.coveredMarkets);
-
-    await Promise.all([
-      ...liquidatablePositions.map((position) => this.liquidate(position)),
-      ...preLiquidatablePositions.map((position) => this.preLiquidate(position)),
-    ]);
+    if (this.isRunning) return;
+    this.isRunning = true;
+    try {
+      await this.fetchMarkets();
+      const { liquidatablePositions, preLiquidatablePositions } =
+        await this.dataProvider.fetchLiquidatablePositions(this.client, this.coveredMarkets);
+      await Promise.all([
+        ...liquidatablePositions.map((position) => this.liquidate(position)),
+        ...preLiquidatablePositions.map((position) => this.preLiquidate(position)),
+      ]);
+    } finally {
+      this.isRunning = false;
+    }
   }
 
   /**
@@ -444,6 +453,18 @@ export class LiquidationBot {
         console.log(
           `${this.logTag}⚡ OPTIMISTIC SENT ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol} tx=${txHash}`,
         );
+        this.shadowLogger?.recordAttempt({
+          borrower: pos.borrower,
+          marketId: pos.marketId,
+          collateralSymbol: pos.collateralSymbol ?? "",
+          loanSymbol: pos.loanSymbol ?? "",
+          ourTxHash: txHash,
+          ourTipWei: dynamicTip,
+          ourMaxFeePerGasWei: dynamicMaxFee,
+          ourSentBlock: 0n,
+          ourSentMs: broadcastedMs,
+          expectedProfitUsd: usd,
+        });
         this.markPositionUsed(marketId, pos.borrower);
         discord
           .notifyTxFired(`${pos.collateralSymbol}/${pos.loanSymbol}`, pos.borrower, txHash, 0)
@@ -505,13 +526,30 @@ export class LiquidationBot {
       } else {
         // Simple path — just send
         const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        let txHash: Hex;
         try {
-          await writeContract(this.client, { address: encoder.address, ...functionData, nonce });
+          txHash = await writeContract(this.client, {
+            address: encoder.address,
+            ...functionData,
+            nonce,
+          });
         } catch (error) {
           this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
           this.markPositionUsed(marketId, pos.borrower);
           throw error;
         }
+        this.shadowLogger?.recordAttempt({
+          borrower: pos.borrower,
+          marketId: pos.marketId,
+          collateralSymbol: pos.collateralSymbol ?? "",
+          loanSymbol: pos.loanSymbol ?? "",
+          ourTxHash: txHash,
+          ourTipWei: 0n,
+          ourMaxFeePerGasWei: 0n,
+          ourSentBlock: 0n,
+          ourSentMs: Date.now(),
+          expectedProfitUsd: 0,
+        });
         this.markPositionUsed(marketId, pos.borrower);
         console.log(
           `${this.logTag}FAST LIQUIDATED ${pos.borrower} on ${marketId} (${pos.collateralSymbol}/${pos.loanSymbol})`,
@@ -947,14 +985,16 @@ export class LiquidationBot {
         const tipAsPriorityFee = tip > 0n ? tip / gasEstimate : 0n;
         const L2_BASE_PRIORITY = parseGwei("0.001");
         const effectivePriorityFee = tipAsPriorityFee + L2_BASE_PRIORITY;
+        const maxFeePerGas = baseFee * 2n + effectivePriorityFee;
 
         const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        let txHash: Hex;
         try {
-          await writeContract(this.client, {
+          txHash = await writeContract(this.client, {
             address: encoder.address,
             ...functionData,
             maxPriorityFeePerGas: effectivePriorityFee,
-            maxFeePerGas: baseFee * 2n + effectivePriorityFee,
+            maxFeePerGas,
             nonce,
           });
         } catch (error) {
@@ -963,17 +1003,49 @@ export class LiquidationBot {
           throw error;
         }
 
+        this.shadowLogger?.recordAttempt({
+          borrower,
+          marketId,
+          collateralSymbol: "",
+          loanSymbol: "",
+          ourTxHash: txHash,
+          ourTipWei: effectivePriorityFee,
+          ourMaxFeePerGasWei: gasPrice,
+          ourSentBlock: 0n,
+          ourSentMs: Date.now(),
+          expectedProfitUsd:
+            grossProfitUsd !== undefined && tipCostUsd !== undefined && gasCostUsd !== undefined
+              ? grossProfitUsd - tipCostUsd - gasCostUsd
+              : 0,
+        });
         this.markPositionUsed(marketId, borrower);
         return true;
       } else {
         const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        let txHash: Hex;
         try {
-          await writeContract(this.client, { address: encoder.address, ...functionData, nonce });
+          txHash = await writeContract(this.client, {
+            address: encoder.address,
+            ...functionData,
+            nonce,
+          });
         } catch (error) {
           this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
           this.markPositionUsed(marketId, borrower);
           throw error;
         }
+        this.shadowLogger?.recordAttempt({
+          borrower,
+          marketId,
+          collateralSymbol: "",
+          loanSymbol: "",
+          ourTxHash: txHash,
+          ourTipWei: 0n,
+          ourMaxFeePerGasWei: gasPrice,
+          ourSentBlock: 0n,
+          ourSentMs: Date.now(),
+          expectedProfitUsd: 0,
+        });
         this.markPositionUsed(marketId, borrower);
       }
     } finally {
@@ -1041,7 +1113,7 @@ export class LiquidationBot {
     return ETH_USD_FALLBACK * USD_SCALE;
   }
 
-  private async usdValueFromEthAmount(amountWei: bigint) {
+  async usdValueFromEthAmount(amountWei: bigint) {
     const ethUsdScaled = await this.getEthUsdPriceScaled();
     const usdScaled = (amountWei * ethUsdScaled) / WAD;
     return Number(usdScaled) / Number(USD_SCALE);

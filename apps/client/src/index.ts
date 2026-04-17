@@ -197,6 +197,7 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     marketsFetchingCooldownMechanism,
     positionLiquidationCooldownMechanism,
     flashbotAccount,
+    shadowLogger,
     alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
     useL2PriorityBidding: config.useL2PriorityBidding,
     primaryWalletCoordinator,

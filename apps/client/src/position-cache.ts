@@ -499,9 +499,8 @@ export class PositionCache {
         });
       }
 
-      this.positions = newPositions;
-
       if (newPositions.length > 0) {
+        this.positions = newPositions;
         console.log(`${this.logTag}PositionCache: loaded ${newPositions.length} at-risk positions`);
         try {
           const hs = (globalThis as { __healthState?: Record<string, unknown> }).__healthState;
@@ -514,7 +513,7 @@ export class PositionCache {
         }
       } else {
         console.log(
-          `${this.logTag}PositionCache: 0 at-risk positions (API returned ${items.length} items, ${items.length - newPositions.length} filtered out)`,
+          `${this.logTag}PositionCache: 0 at-risk positions (API returned ${items.length} items, ${items.length - newPositions.length} filtered out); preserving ${this.positions.length} cached positions`,
         );
       }
     } catch (err) {

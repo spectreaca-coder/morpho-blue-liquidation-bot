@@ -206,6 +206,12 @@ export class AutoRefuel {
       try {
         let swapTx: Hex;
         if (actualSpend < this.maxUsdcSpend) {
+          const ETH_PRICE_USD_CONSERVATIVE = 3500n;
+          const SLIPPAGE_NUM = 9n;
+          const SLIPPAGE_DEN = 10n;
+          const amountOutMinimum =
+            (actualSpend * 10_000_000_000_000n * SLIPPAGE_NUM) /
+            (ETH_PRICE_USD_CONSERVATIVE * SLIPPAGE_DEN);
           swapTx = await this.writeContract(walletClient, lease, {
             address: SWAP_ROUTER,
             abi: swapRouterAbi,
@@ -217,7 +223,7 @@ export class AutoRefuel {
                 fee: 500, // 0.05% fee tier (most liquid USDC/WETH pool on Base)
                 recipient: wallet.address,
                 amountIn: actualSpend,
-                amountOutMinimum: 0n,
+                amountOutMinimum: amountOutMinimum,
                 sqrtPriceLimitX96: 0n,
               },
             ],
