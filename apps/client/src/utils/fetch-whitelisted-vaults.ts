@@ -23,10 +23,18 @@ interface VaultsResponse {
 }
 
 export async function fetchWhitelistedVaults(chainId: number): Promise<Address[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 15000);
+
   const res = await fetch("https://blue-api.morpho.org/graphql", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query: QUERY, variables: { chainIds: [chainId] } }),
+    signal: controller.signal,
+  }).finally(() => {
+    clearTimeout(timeout);
   });
 
   const json = (await res.json()) as VaultsResponse;

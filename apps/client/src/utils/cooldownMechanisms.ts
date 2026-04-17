@@ -14,16 +14,26 @@ export class PositionLiquidationCooldownMechanism {
       this.positionReadyAt[marketId] = {};
     }
 
-    if (this.positionReadyAt[marketId][account] === undefined) {
-      this.positionReadyAt[marketId][account] = 0;
-    }
+    // Prune expired entries in this market bucket to prevent unbounded memory growth
+    const now = Date.now() / 1000;
+    let bucket = this.positionReadyAt[marketId];
+    bucket = Object.fromEntries(
+      Object.entries(bucket).filter(([, readyAt]) => readyAt > now),
+    ) as Record<Address, number>;
+    this.positionReadyAt[marketId] = bucket;
 
-    if (this.positionReadyAt[marketId][account] > Date.now() / 1000) {
+    if (bucket[account] !== undefined && bucket[account] > now) {
       return false;
     }
 
-    this.positionReadyAt[marketId][account] = Date.now() / 1000 + this.cooldownPeriod;
     return true;
+  }
+
+  markPositionUsed(marketId: Hex, account: Address) {
+    if (this.positionReadyAt[marketId] === undefined) {
+      this.positionReadyAt[marketId] = {};
+    }
+    this.positionReadyAt[marketId][account] = Date.now() / 1000 + this.cooldownPeriod;
   }
 }
 
@@ -40,7 +50,10 @@ export class MarketsFetchingCooldownMechanism {
     if (this.readyAt > Date.now() / 1000) {
       return false;
     }
-    this.readyAt = Date.now() / 1000 + this.cooldownPeriod;
     return true;
+  }
+
+  markFetchingDone() {
+    this.readyAt = Date.now() / 1000 + this.cooldownPeriod;
   }
 }

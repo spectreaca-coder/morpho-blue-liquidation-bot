@@ -8,15 +8,43 @@ import {
 import type { DataProvider } from "@morpho-blue-liquidation-bot/data-providers";
 import { createLiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import { createPricer } from "@morpho-blue-liquidation-bot/pricers";
-import { createWalletClient, Hex, http } from "viem";
+import {
+  createPublicClient,
+  createWalletClient,
+  type Address,
+  type Hex,
+  fallback,
+  http,
+  webSocket,
+} from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { watchBlocks } from "viem/actions";
 
+import { AutoRefuel } from "./auto-refuel";
 import { LiquidationBot, type LiquidationBotInputs } from "./bot";
+import { CanaryTracker, loadCanaryConfigFromEnv } from "./canary";
+import {
+  CexPredictor,
+  ORACLE_TO_CEX_MAP,
+  calculateTriggerPrice,
+  type ThresholdCrossing,
+  type LiquidationThreshold,
+} from "./cex-predictor";
+import { discord } from "./discord-notifier";
+import { FlashblockHandler } from "./flashblock-handler";
+import { FlashblockWatcher, BASE_AGGREGATORS } from "./flashblock-watcher";
+import { SKIP_SYMBOLS, MIN_BORROW_USDC_6DEC, MIN_BORROW_WETH_18DEC } from "./liquidation-constants";
+import { NonceManager } from "./nonce-manager";
+import { PositionCache } from "./position-cache";
+import { PrimaryWalletCoordinator } from "./primary-wallet-coordinator";
+import { ShadowLogger } from "./shadow-logger";
+import { TxCache } from "./tx-cache";
 import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
 } from "./utils/cooldownMechanisms";
+import { MORPHO_BLUE } from "./utils/selfFundingTip";
+import { WalletPool } from "./wallet-pool";
 
 export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
   const logTag = `[${config.chain.name} client]: `;
@@ -24,8 +52,83 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
 
   const client = createWalletClient({
     chain: config.chain,
-    transport: http(config.rpcUrl),
+    transport: config.fallbackRpcUrl
+      ? fallback([http(config.rpcUrl), http(config.fallbackRpcUrl)])
+      : http(config.rpcUrl),
     account: privateKeyToAccount(config.liquidationPrivateKey),
+  });
+  const publicClient = createPublicClient({
+    chain: config.chain,
+    transport: config.fallbackRpcUrl
+      ? fallback([http(config.rpcUrl), http(config.fallbackRpcUrl)])
+      : http(config.rpcUrl),
+  });
+
+  // WALLET POOL — multi-wallet support
+  // Primary wallet (index 0) always exists. Additional wallets are optional:
+  // LIQUIDATION_PRIVATE_KEY_{chainId}_1, EXECUTOR_ADDRESS_{chainId}_1, etc.
+  const defaultAffinities: string[][] = [
+    ["btc", "wbtc", "cbbtc"], // Wallet 0: BTC markets
+    ["eth", "weth", "wsteth", "cbeth"], // Wallet 1: ETH markets
+    ["xrp", "ada", "ltc", "link", "sol"], // Wallet 2: altcoin overflow
+  ];
+  const walletAffinities = config.walletAffinities ?? defaultAffinities;
+
+  const walletEntries: {
+    client: ReturnType<typeof createWalletClient>;
+    executorAddress: Address;
+    marketAffinity: string[];
+  }[] = [
+    {
+      client,
+      executorAddress: config.executorAddress,
+      marketAffinity: walletAffinities[0] ?? [],
+    },
+  ];
+
+  // Load additional wallets from env (optional)
+  for (let i = 1; i <= 10; i++) {
+    const pkEnvKey = `LIQUIDATION_PRIVATE_KEY_${config.chainId}_${i}`;
+    const execEnvKey = `EXECUTOR_ADDRESS_${config.chainId}_${i}`;
+    const pk = process.env[pkEnvKey];
+    const exec = process.env[execEnvKey];
+
+    if (pk === undefined || exec === undefined) break; // Stop at first missing pair
+
+    const additionalClient = createWalletClient({
+      chain: config.chain,
+      transport: config.fallbackRpcUrl
+        ? fallback([http(config.rpcUrl), http(config.fallbackRpcUrl)])
+        : http(config.rpcUrl),
+      account: privateKeyToAccount(pk as Hex),
+    });
+
+    walletEntries.push({
+      client: additionalClient,
+      executorAddress: exec as Address,
+      marketAffinity: walletAffinities[i] ?? [],
+    });
+    console.log(`${logTag}Additional wallet[${i}] loaded: executor=${exec}`);
+  }
+
+  const walletPool = new WalletPool(walletEntries, logTag);
+  const primaryWalletCoordinator = new PrimaryWalletCoordinator(
+    client,
+    config.executorAddress,
+    logTag,
+  );
+  const executorAddresses = new Set<Address>([config.executorAddress.toLowerCase() as Address]);
+  const executorPrefix = `EXECUTOR_ADDRESS_${config.chainId}`;
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith(executorPrefix) || !value) continue;
+    executorAddresses.add(value.toLowerCase() as Address);
+  }
+  const shadowLogger = new ShadowLogger({
+    logPath: "logs/shadow_events.jsonl",
+    publicClient,
+    morphoAddress: MORPHO_BLUE,
+    ourExecutorAddresses: executorAddresses,
+    logTag,
   });
 
   // LIQUIDITY VENUES
@@ -38,7 +141,7 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     ? config.pricers.map((pricerName) => createPricer(pricerName))
     : undefined;
 
-  // FlASHBOTS
+  // FLASHBOTS
 
   let flashbotAccount = undefined;
   if (config.useFlashbots) {
@@ -62,6 +165,23 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     MARKETS_FETCHING_COOLDOWN_PERIOD,
   );
 
+  // NONCE MANAGER — retained for secondary wallets. wallet[0] nonces are owned by
+  // PrimaryWalletCoordinator and must not be pre-warmed or reset externally.
+  const nonceManager = new NonceManager();
+
+  // CANARY TRACKER — Phase 2 production validation gate.
+  // Controlled by env (CANARY_MODE=true to enable). Pass-through when disabled.
+  const canary = new CanaryTracker(loadCanaryConfigFromEnv());
+  if (canary.enabled) {
+    const stats = canary.getStats();
+    console.log(
+      `${logTag}CANARY ENABLED: dailyCap=$${stats.todayGasCapUsd} weeklyCap=$${stats.weekGasCapUsd} lossCap=$${stats.maxLossCapUsd} cumulativeProfit=$${stats.cumulativeProfitUsd.toFixed(2)}`,
+    );
+    if (canary.stopped) {
+      console.error(`${logTag}CANARY STOPPED (persistent state): ${canary.stoppedReason}`);
+    }
+  }
+
   const inputs: LiquidationBotInputs = {
     logTag,
     chainId: config.chainId,
@@ -78,33 +198,400 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     positionLiquidationCooldownMechanism,
     flashbotAccount,
     alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
+    useL2PriorityBidding: config.useL2PriorityBidding,
+    primaryWalletCoordinator,
+    canary,
   };
 
   const bot = new LiquidationBot(inputs);
 
-  const blockInterval = config.blockInterval ?? 1;
-  let count = 0;
+  // FAST PATH — PositionCache + CEX Predictor (all chains with useFastPath)
+  if (config.useFastPath) {
+    // Position cache must be created before CEX predictor (used in CEX callback)
+    const marketIds = [...config.additionalMarketsWhitelist.map((id) => id as string)];
+    const positionCache = new PositionCache(
+      logTag,
+      config.chainId,
+      marketIds.length > 0 ? marketIds : undefined,
+    );
+    positionCache.start(30_000);
 
-  const startWatching = () => {
-    watchBlocks(client, {
-      onBlock: () => {
-        if (count % blockInterval === 0) {
-          bot.run().catch((e) => {
-            console.error(`${logTag} uncaught error in bot.run():`, e);
+    // TX CACHE — pre-builds liquidation calldata for near-liquidation positions
+    const txCache = new TxCache({
+      logTag,
+      chainId: config.chainId,
+      client,
+      executorAddress: config.executorAddress,
+      treasuryAddress: config.treasuryAddress ?? client.account.address,
+      liquidityVenues,
+      liquidationBufferBps: config.liquidationBufferBps,
+    });
+
+    // NONCE MANAGER — pre-warm secondary wallets only. wallet[0] is owned by
+    // PrimaryWalletCoordinator and lazily reads pending nonce under its lease.
+    walletEntries.forEach((entry, index) => {
+      if (index === 0) return;
+      nonceManager.preWarm(entry.client, index).catch((e: unknown) => {
+        console.error("[notify]", e instanceof Error ? e.message : e);
+      });
+    });
+
+    // Refresh TxCache — hybrid strategy:
+    // 1. Timer: every 30 minutes (background, keeps cache warm)
+    // 2. Event-driven: when Flashblock detects >1% price move (instant freshness when it matters)
+    let lastTxCacheRefreshMs = 0;
+    const TX_CACHE_COOLDOWN_MS = 60_000; // Don't rebuild more than once per minute
+    const refreshTxCache = (trigger?: string) => {
+      const now = Date.now();
+      if (now - lastTxCacheRefreshMs < TX_CACHE_COOLDOWN_MS) return;
+      lastTxCacheRefreshMs = now;
+      const candidates = positionCache.findNearLiquidation(1.05);
+      if (candidates.length > 0) {
+        const positions = candidates.map((c) => c.position);
+        txCache
+          .build(positions)
+          .then(() => {
+            walletEntries.forEach((w, i) => {
+              if (i !== 0)
+                nonceManager.preWarm(w.client, i).catch((e: unknown) => {
+                  console.error("[nonce-prewarm]", e instanceof Error ? e.message : e);
+                });
+            });
+          })
+          .catch((err: unknown) => {
+            console.error(
+              `${logTag}TxCache build error:`,
+              err instanceof Error ? err.message : err,
+            );
+          });
+        if (trigger) {
+          console.log(`${logTag}TxCache: event-driven refresh (${trigger})`);
+        }
+      }
+    };
+    setTimeout(() => {
+      refreshTxCache();
+    }, 10_000);
+    setInterval(() => {
+      refreshTxCache();
+    }, 10 * 60_000); // 10분 주기 (was 30min)
+
+    // Track in-flight liquidation attempts for the CEX Predictor path
+    const inFlightBorrowersCex = new Set<string>();
+    // Will be set when FlashblockHandler is created (if L2 bidding is enabled)
+    let flashblockHandler: FlashblockHandler | null = null;
+
+    const predictor = new CexPredictor(logTag, (crossings: ThresholdCrossing[]) => {
+      if (crossings.length === 0) return;
+      // Skip CEX fire if Flashblock batch is in flight OR a wallet is acquired (nonce race prevention).
+      // primaryWalletCoordinator.isBusy covers wallet[0]; walletPool.isAnyAcquired() covers
+      // secondary wallet paths that still use the pool.
+      if (
+        flashblockHandler?.isBatchInFlight ||
+        primaryWalletCoordinator.isBusy ||
+        walletPool.isAnyAcquired()
+      ) {
+        console.log(`${logTag}CEX ALERT: wallet busy — skipping to avoid nonce collision`);
+        return;
+      }
+      const top = crossings[0]!;
+      console.log(
+        `${logTag}⚡ CEX ALERT: ${top.threshold.collateralSymbol} $${top.currentCexPrice.toFixed(2)} ` +
+          `crossed trigger $${top.threshold.triggerCexPrice.toFixed(2)} (${top.dropPercent.toFixed(2)}% below) — ` +
+          `${crossings.length} positions at risk`,
+      );
+      // Fast-path: attempt liquidation on near-liquidation positions
+      // Apply same filters as Flashblock path to avoid unprofitable/unsupported liquidations.
+      const candidates = positionCache.findNearLiquidation().filter((c) => {
+        if (SKIP_SYMBOLS.has(c.position.collateralSymbol.toLowerCase())) return false;
+        const minBorrow =
+          c.position.loanDecimals <= 8 ? MIN_BORROW_USDC_6DEC : MIN_BORROW_WETH_18DEC;
+        return c.borrowAssets >= minBorrow;
+      });
+      if (candidates.length > 0) {
+        for (const candidate of candidates.slice(0, 5)) {
+          const borrowerKey = candidate.position.borrower.toLowerCase();
+          if (inFlightBorrowersCex.has(borrowerKey)) continue;
+          inFlightBorrowersCex.add(borrowerKey);
+          bot
+            .fastLiquidate(candidate.position, candidate.seizableCollateral, candidate.borrowAssets)
+            .catch((e: unknown) => {
+              console.error(
+                `${logTag}CEX fast liquidate error:`,
+                e instanceof Error ? e.message : e,
+              );
+            })
+            .finally(() => inFlightBorrowersCex.delete(borrowerKey));
+        }
+      } else {
+        // No near-liquidation positions cached — skip.
+        // bot.run() was here as fallback but costs 50K CU per call.
+        // PositionCache updates every 30s; if no near-liquidation now, wait for next update.
+        console.log(`${logTag}CEX ALERT: no near-liquidation positions in cache — skipping`);
+      }
+    });
+    predictor.start();
+    console.log(`${logTag}CEX Predictor enabled`);
+
+    // Periodically load at-risk positions into the threshold table
+    const loadThresholds = async () => {
+      try {
+        const query = JSON.stringify({
+          query: `{
+            marketPositions(
+              where: {
+                chainId_in: [${config.chainId}],
+                healthFactor_gte: 0.9,
+                healthFactor_lte: 1.30,
+                borrowShares_gte: 1
+              },
+              first: 500
+            ) {
+              items {
+                user { address }
+                market {
+                  uniqueKey
+                  oracleAddress
+                  lltv
+                  collateralAsset { symbol decimals }
+                  loanAsset { symbol decimals }
+                }
+                borrowAssets
+                collateral
+                healthFactor
+              }
+            }
+          }`,
+        });
+
+        const response = await fetch("https://blue-api.morpho.org/graphql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: query,
+          signal: AbortSignal.timeout(30_000),
+        });
+
+        const data = (await response.json()) as {
+          data?: {
+            marketPositions?: {
+              items?: {
+                user: { address: string };
+                market: {
+                  uniqueKey: string;
+                  oracleAddress: string;
+                  lltv: string;
+                  collateralAsset: { symbol: string; decimals: number };
+                  loanAsset: { symbol: string; decimals: number };
+                };
+                borrowAssets: string;
+                collateral: string;
+                healthFactor: number;
+              }[];
+            };
+          };
+        };
+
+        const items = data.data?.marketPositions?.items ?? [];
+        if (items.length === 0) return;
+
+        const newThresholds: LiquidationThreshold[] = [];
+
+        for (const item of items) {
+          const oracleAddr = item.market.oracleAddress.toLowerCase();
+          const cexMapping = ORACLE_TO_CEX_MAP[oracleAddr];
+          if (!cexMapping) continue; // No CEX mapping for this oracle
+
+          const collateral = BigInt(item.collateral);
+          const borrowAssets = BigInt(item.borrowAssets);
+          const lltv = BigInt(item.market.lltv);
+
+          if (collateral === 0n || borrowAssets === 0n) continue;
+
+          const { triggerOraclePrice, triggerCexPrice } = calculateTriggerPrice(
+            collateral,
+            borrowAssets,
+            lltv,
+            0n, // oracleScaleFactor not used currently
+            item.market.collateralAsset.decimals,
+            item.market.loanAsset.decimals,
+          );
+
+          if (triggerCexPrice <= 0 || !isFinite(triggerCexPrice)) continue;
+
+          newThresholds.push({
+            borrower: item.user.address as Address,
+            marketId: item.market.uniqueKey as Hex,
+            triggerOraclePrice,
+            triggerCexPrice,
+            collateralSymbol: item.market.collateralAsset.symbol,
+            cexPair: cexMapping.pair,
+            seizableCollateral: collateral,
+            borrowAssets,
+            lltv,
           });
         }
-        count++;
-      },
-      onError: (error) => {
-        const retryDelay = config.watchBlocksRetryDelayMs ?? 5_000;
-        console.error(
-          `${logTag} watchBlocks error, restarting watcher in ${retryDelay}ms:`,
-          error,
-        );
-        setTimeout(startWatching, retryDelay);
-      },
-    });
-  };
 
-  startWatching();
+        if (newThresholds.length > 0) {
+          predictor.updateThresholds(newThresholds);
+        }
+      } catch (err: unknown) {
+        console.error(
+          `${logTag}CEX threshold load error:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    };
+
+    // Load thresholds immediately, then every 30 seconds
+    void loadThresholds();
+    setInterval(() => {
+      void loadThresholds();
+    }, 30_000);
+
+    // FLASHBLOCK WATCHER — Base only (Flashblocks is a Base-specific feature)
+    if (config.useL2PriorityBidding) {
+      flashblockHandler = new FlashblockHandler(
+        logTag,
+        config,
+        bot,
+        positionCache,
+        txCache,
+        primaryWalletCoordinator,
+        canary,
+        shadowLogger,
+      );
+
+      // Wire event-driven TxCache refresh to the handler
+      flashblockHandler.onSignificantPriceMove = refreshTxCache;
+
+      // Wire flash crash detection → immediate PositionCache + TxCache reload
+      flashblockHandler.onFlashCrashDetected = () => {
+        console.log(`${logTag}🚨 Flash crash: reloading PositionCache + TxCache immediately`);
+        positionCache.reload(); // immediate API fetch, no interval duplication
+        setTimeout(() => {
+          refreshTxCache();
+        }, 3_000); // rebuild TxCache 3s after cache refresh
+      };
+
+      const flashblockWatcher = new FlashblockWatcher(logTag, BASE_AGGREGATORS, (event) => {
+        flashblockHandler!.handleOracleUpdate(event);
+      });
+      flashblockWatcher.start();
+      console.log(
+        `${logTag}FlashblockWatcher enabled — monitoring ${BASE_AGGREGATORS.length} aggregator addresses`,
+      );
+
+      // Safety net: if Flashblock goes silent for 10 min, run bot.run() once.
+      // Chainlink heartbeat is max 1 hour, so 10 min silence likely = WS issue.
+      let lastSafetyNetRunMs = 0;
+      setInterval(() => {
+        void (async () => {
+          const now = Date.now();
+          const silenceMs = now - flashblockHandler!.lastFlashblockEventMs;
+          const safetyNetCooldownMs = 10 * 60_000;
+          if (silenceMs > safetyNetCooldownMs && now - lastSafetyNetRunMs > safetyNetCooldownMs) {
+            lastSafetyNetRunMs = now;
+            console.log(
+              `${logTag}⚠️ Flashblock silent ${Math.floor(silenceMs / 60_000)}min — safety net bot.run()`,
+            );
+            discord
+              .notifyError(
+                "FlashblockWatcher",
+                `Silent ${Math.floor(silenceMs / 60_000)}min — WS may be disconnected`,
+              )
+              .catch((e: unknown) => {
+                console.error("[notify]", e instanceof Error ? e.message : e);
+              });
+            try {
+              await bot.run();
+            } catch (e: unknown) {
+              console.error(`${logTag}Safety net error:`, e instanceof Error ? e.message : e);
+            }
+          }
+        })();
+      }, 5 * 60_000);
+    }
+  }
+
+  // bot.run() fallback — DISABLED when fast path is active to save RPC CUs.
+  // Fast path (FlashblockWatcher + CEX Predictor + PositionCache) handles
+  // oracle-triggered liquidations with near-zero RPC usage. bot.run() does
+  // heavy on-chain multicalls (~50K CU per run) to catch interest-accrual
+  // liquidations, which are extremely rare. Enable only on chains without fast path.
+  if (!config.useFastPath) {
+    const blockInterval = config.blockInterval ?? 1;
+    let count = 0;
+
+    const watchClient = config.wsUrl
+      ? createPublicClient({ chain: config.chain, transport: webSocket(config.wsUrl) })
+      : client;
+
+    if (config.wsUrl) {
+      console.log(`${logTag}Using WebSocket for block detection: ${config.wsUrl}`);
+    }
+
+    const startWatching = () => {
+      watchBlocks(watchClient, {
+        onBlock: () => {
+          if (count % blockInterval === 0) {
+            bot.run().catch((e: unknown) => {
+              console.error(`${logTag} uncaught error in bot.run():`, e);
+            });
+          }
+          count++;
+        },
+        onError: (error) => {
+          const retryDelay = config.watchBlocksRetryDelayMs ?? 5_000;
+          console.error(
+            `${logTag} watchBlocks error, restarting watcher in ${retryDelay}ms:`,
+            error,
+          );
+          setTimeout(startWatching, retryDelay);
+        },
+      });
+    };
+
+    startWatching();
+  } else {
+    console.log(`${logTag}bot.run() fallback DISABLED — fast path is active (saves ~50K CU/run)`);
+    // Periodic safety net: run bot.run() every 30 minutes to catch positions
+    // that fall outside the PositionCache window (deep bad debt, interest accrual).
+    // Cost: ~50K CU per run = ~1.5M CU/month = 5% of Alchemy free tier.
+    setInterval(() => {
+      void (async () => {
+        try {
+          console.log(`${logTag}Periodic bot.run() safety net...`);
+          await bot.run();
+        } catch (e: unknown) {
+          console.error(`${logTag}Periodic bot.run() error:`, e instanceof Error ? e.message : e);
+        }
+      })();
+    }, 30 * 60_000);
+  }
+
+  // AUTO-REFUEL: convert USDC profits → ETH gas when balance is low.
+  // Only on Base (L2 gas is cheap, swap is cheap). ETH L1 gas refuel is manual.
+  if (config.chainId === 8453) {
+    // Flash-loan architecture: the wallet only holds gas money. Reserve is
+    // `700K gas * maxFeePerGas`, which we cap at 5 gwei (whale tier) → 0.0035 ETH.
+    // Refuel target covers ~2 whale TXs back-to-back before the next 30-min tick.
+    const autoRefuel = new AutoRefuel({
+      logTag,
+      rpcUrl: config.rpcUrl,
+      minEthWei: 3_000_000_000_000_000n, // 0.003 ETH (~$6.6) → trigger (1 whale TX remaining)
+      refuelAmountWei: 8_000_000_000_000_000n, // 0.008 ETH (~$17.6) → target (~2-3 whale TXs)
+      maxUsdcSpend: 25_000_000n, // 25 USDC cap matches 0.008 ETH target at ~$3.3k/ETH
+      intervalMs: 30 * 60_000, // check every 30 min
+      primaryWalletCoordinator,
+    });
+    for (const entry of walletEntries) {
+      autoRefuel.addWallet(entry.client, walletEntries.indexOf(entry));
+    }
+    autoRefuel.start();
+  }
+
+  // Discord startup notification
+  discord.notifyStartup("v18", walletEntries.length, [config.chain.name]).catch((e: unknown) => {
+    console.error("[notify]", e instanceof Error ? e.message : e);
+  });
 };

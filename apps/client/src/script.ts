@@ -51,7 +51,11 @@ async function run() {
   try {
     await startHealthServer();
   } catch (err) {
-    console.error("Failed to start health server:", err);
+    console.error(
+      "Fatal: failed to start health server; refusing to launch bots to prevent split-brain:",
+      err,
+    );
+    process.exit(1);
   }
 
   for (const config of configs) {

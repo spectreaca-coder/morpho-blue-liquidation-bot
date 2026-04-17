@@ -1,3 +1,4 @@
+export { AerodromeV3Venue } from "./aerodromeV3/index.js";
 export * from "./uniswapV3";
 export * from "./uniswapV4";
 export * from "./erc4626";

@@ -19,3 +19,22 @@ export const specificFactoryAddresses: Record<number, Address> = {
 };
 
 export const FEE_TIERS = [500, 3000, 10000];
+
+// Pre-verified pool addresses. getPool() is CREATE2-deterministic, so these addresses do not change.
+// Only single-pool pairs should be listed here, where selecting by liquidity is unnecessary.
+export const KNOWN_POOLS: Record<number, [Address, Address, Address][]> = {
+  [base.id]: [
+    // wrsETH/WETH — fee 3000 (only active pool, liquidity ~697B)
+    [
+      "0xEDfa23602D0EC14714057867A78d01e94176BEA0" as Address,
+      "0x4200000000000000000000000000000000000006" as Address,
+      "0x16e25fAcBA67a40dA3436ab9E2E00C30daB0dD97" as Address,
+    ],
+    // cbETH/USDC — fee 3000 (only active pool, others have 0 liquidity)
+    [
+      "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22" as Address,
+      "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address,
+      "0xa8E4C55D6dAf4D768aeBa2378c1AD94c112Ef48a" as Address,
+    ],
+  ],
+};

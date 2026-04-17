@@ -13,10 +13,12 @@ import {
 import { executorAbi } from "executooor-viem";
 import {
   erc20Abi,
+  formatEther,
   formatUnits,
   getAddress,
   LocalAccount,
   maxUint256,
+  parseGwei,
   parseUnits,
   type Account,
   type Address,
@@ -26,13 +28,22 @@ import {
   type WalletClient,
 } from "viem";
 import {
-  getBlockNumber,
+  getBalance,
+  getBlock,
   getGasPrice,
+  getTransactionReceipt,
   readContract,
   simulateCalls,
   writeContract,
 } from "viem/actions";
 
+import { type CanaryTracker } from "./canary.js";
+import { discord } from "./discord-notifier.js";
+import type { CachedPosition } from "./position-cache.js";
+import {
+  type PrimaryWalletCoordinator,
+  type PrimaryWalletLease,
+} from "./primary-wallet-coordinator";
 import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
@@ -41,6 +52,13 @@ import { fetchWhitelistedVaults } from "./utils/fetch-whitelisted-vaults.js";
 import { Flashbots } from "./utils/flashbots.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
+import { resolveShareLiquidationPlan } from "./utils/morphoLiquidation.js";
+import { MultiBuilderSubmitter } from "./utils/multiBuilder.js";
+
+const CBXRP_FAST_PATH_SEIZE_BPS = 500n;
+const BPS = 10_000n;
+const ETH_USD_FALLBACK = 3500n;
+const USD_SCALE = 1_000_000n;
 
 export interface LiquidationBotInputs {
   logTag: string;
@@ -54,10 +72,15 @@ export interface LiquidationBotInputs {
   dataProvider: DataProvider;
   liquidityVenues: LiquidityVenue[];
   alwaysRealizeBadDebt: boolean;
+  useL2PriorityBidding?: boolean;
   pricers?: Pricer[];
   positionLiquidationCooldownMechanism?: PositionLiquidationCooldownMechanism;
   marketsFetchingCooldownMechanism: MarketsFetchingCooldownMechanism;
   flashbotAccount?: LocalAccount;
+  tipBps?: bigint;
+  primaryWalletCoordinator: PrimaryWalletCoordinator;
+  /** Phase 2 canary gate. Optional; when absent, all attempts pass through. */
+  canary?: CanaryTracker;
 }
 
 export class LiquidationBot {
@@ -76,8 +99,13 @@ export class LiquidationBot {
   private positionLiquidationCooldownMechanism?: PositionLiquidationCooldownMechanism;
   private marketsFetchingCooldownMechanism: MarketsFetchingCooldownMechanism;
   private flashbotAccount?: LocalAccount;
+  private tipBps?: bigint;
+  private useL2PriorityBidding: boolean;
   private coveredMarkets: Hex[];
   private alwaysRealizeBadDebt: boolean;
+  private multiBuilder?: MultiBuilderSubmitter;
+  private primaryWalletCoordinator: PrimaryWalletCoordinator;
+  private canary?: CanaryTracker;
 
   constructor(inputs: LiquidationBotInputs) {
     this.logTag = inputs.logTag;
@@ -95,8 +123,15 @@ export class LiquidationBot {
     this.positionLiquidationCooldownMechanism = inputs.positionLiquidationCooldownMechanism;
     this.marketsFetchingCooldownMechanism = inputs.marketsFetchingCooldownMechanism;
     this.flashbotAccount = inputs.flashbotAccount;
+    this.tipBps = inputs.tipBps;
+    this.useL2PriorityBidding = inputs.useL2PriorityBidding ?? false;
     this.coveredMarkets = [];
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt;
+    this.primaryWalletCoordinator = inputs.primaryWalletCoordinator;
+    this.canary = inputs.canary;
+    if (inputs.flashbotAccount) {
+      this.multiBuilder = new MultiBuilderSubmitter(inputs.flashbotAccount);
+    }
   }
 
   async run() {
@@ -111,6 +146,406 @@ export class LiquidationBot {
     ]);
   }
 
+  /**
+   * Optimistic fast-path liquidation — skips simulation, sends TX directly.
+   *
+   * Revert cost on Base: ~$0.001. Saves ~200ms vs simulation path.
+   * 936 reverts = $1 cost; a single successful liquidation covers thousands of reverts.
+   *
+   * For L1 (ETH mainnet with Flashbots), falls back to handleTx with simulation
+   * since reverts waste bundle inclusion and gas is expensive.
+   */
+  async fastLiquidate(
+    pos: CachedPosition,
+    seizableCollateral: bigint,
+    borrowAssets: bigint,
+  ): Promise<boolean> {
+    const lease = this.primaryWalletCoordinator.tryAcquire(
+      `fastLiquidate:${pos.borrower.toLowerCase()}:${pos.marketId}`,
+    );
+    if (lease === null) {
+      console.log(
+        `${this.logTag}fastLiquidate: primary wallet busy — skipping ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol}`,
+      );
+      return false;
+    }
+
+    try {
+      return await this.fastLiquidateWithLease(lease, pos, seizableCollateral, borrowAssets);
+    } finally {
+      this.primaryWalletCoordinator.release(lease);
+    }
+  }
+
+  private async fastLiquidateWithLease(
+    lease: PrimaryWalletLease,
+    pos: CachedPosition,
+    seizableCollateral: bigint,
+    borrowAssets: bigint,
+  ): Promise<boolean> {
+    const marketParams = {
+      loanToken: pos.loanToken,
+      collateralToken: pos.collateralToken,
+      oracle: pos.oracle,
+      irm: pos.irm,
+      lltv: pos.lltv,
+    };
+
+    const marketId = pos.marketId;
+    if (!this.checkCooldown(marketId, pos.borrower)) return false;
+
+    const badDebtPosition = seizableCollateral === pos.collateral;
+
+    const { executorAddress } = this;
+    const encoder = new LiquidationEncoder(executorAddress, this.client);
+    const morpho = this.chainAddresses.morpho;
+    const market = {
+      loanToken: marketParams.loanToken,
+      collateralToken: marketParams.collateralToken,
+      oracle: marketParams.oracle,
+      irm: marketParams.irm,
+      lltv: BigInt(marketParams.lltv),
+    };
+
+    // Compute safe repaidShares using Morpho math to avoid underflow.
+    // Morpho's liquidate(seizedAssets) can underflow when computed repaidShares > borrower's shares.
+    // Instead, use the repaidShares path: compute shares from target seized amount.
+    const decreasedSeizable = this.capFastPathSeizableCollateral(
+      pos,
+      this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
+    );
+
+    // Read oracle price for share calculation
+    let oraclePrice: bigint;
+    try {
+      oraclePrice = await readContract(this.client, {
+        address: marketParams.oracle,
+        abi: [
+          {
+            name: "price",
+            type: "function",
+            stateMutability: "view",
+            inputs: [],
+            outputs: [{ type: "uint256" }],
+          },
+        ] as const,
+        functionName: "price",
+      });
+    } catch {
+      console.warn(
+        `${this.logTag}Fast liquidate: cannot read oracle price for ${pos.collateralSymbol}/${pos.loanSymbol}`,
+      );
+      return false;
+    }
+
+    const liquidationPlan = resolveShareLiquidationPlan({
+      borrowShares: pos.borrowShares,
+      collateral: pos.collateral,
+      totalBorrowAssets: pos.totalBorrowAssets,
+      totalBorrowShares: pos.totalBorrowShares,
+      price: oraclePrice,
+      lltv: pos.lltv,
+      targetSeizedAssets: decreasedSeizable,
+    });
+
+    if (liquidationPlan === null) {
+      console.warn(
+        `${this.logTag}Fast liquidate: no safe repaidShares plan for ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol}`,
+      );
+      return false;
+    }
+
+    // Step 1: Build collateral->loan conversion using predicted seized amount
+    if (
+      !(await this.convertCollateralToLoan(marketParams, liquidationPlan.seizedAssets, encoder))
+    ) {
+      console.warn(
+        `${this.logTag}Fast liquidate: no venue for ${pos.collateralSymbol}->${pos.loanSymbol}`,
+      );
+      return false;
+    }
+    const collateralToLoanCalls = encoder.flush();
+
+    // Step 2: Repay amount based on predicted repaidAssets (not full borrowAssets)
+    const repayAmount = (liquidationPlan.repaidAssets * 101n) / 100n;
+
+    // Step 3: Build flash loan liquidation using repaidShares (avoids underflow)
+    encoder.erc20Approve(marketParams.loanToken, morpho, 0n);
+    encoder.erc20Approve(marketParams.loanToken, morpho, maxUint256);
+    encoder.morphoBlueLiquidate(
+      morpho,
+      market,
+      pos.borrower,
+      0n,
+      liquidationPlan.repaidShares,
+      collateralToLoanCalls,
+    );
+
+    const flashLoanCallbackCalls = encoder.flush();
+
+    // Wrap in flash loan
+    const KNOWN_NON_STANDARD = new Set([
+      "0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT
+    ]);
+    const isNonStandard = KNOWN_NON_STANDARD.has(marketParams.loanToken.toLowerCase());
+
+    if (isNonStandard) {
+      const BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Address;
+      encoder.erc20Approve(marketParams.loanToken, BALANCER_VAULT, 0n);
+      encoder.erc20Approve(marketParams.loanToken, BALANCER_VAULT, repayAmount);
+      const vaultApprovals = encoder.flush();
+      encoder.balancerFlashLoan(
+        BALANCER_VAULT,
+        [{ asset: marketParams.loanToken, amount: repayAmount }],
+        [...flashLoanCallbackCalls, ...vaultApprovals],
+      );
+    } else {
+      encoder.blueFlashLoan(morpho, marketParams.loanToken, repayAmount, flashLoanCallbackCalls);
+    }
+
+    encoder.erc20Skim(marketParams.loanToken, this.treasuryAddress);
+    const calls = encoder.flush();
+
+    const functionData = {
+      abi: executorAbi,
+      functionName: "exec_606BaXt",
+      args: [calls],
+    } as const;
+
+    try {
+      if (this.useL2PriorityBidding) {
+        // OPTIMISTIC L2 PATH — skip simulation, send immediately
+        // Zero extra RPC calls. Revert cost ~$0.001, saves ~200ms.
+        // Base Flashblocks: FIFO between flashblocks, priority fee within same flashblock.
+        // H1: tier priority fee by estimated borrow USD. See FlashblockHandler for calibration.
+        const loanSym = (pos.loanSymbol ?? "").toLowerCase();
+        let usd = 0;
+        if (loanSym.includes("usdc") || loanSym.includes("usdt") || loanSym.includes("eurc")) {
+          usd = Number(borrowAssets) / 1e6;
+        } else if (loanSym.includes("weth") || loanSym.includes("eth")) {
+          usd = await this.usdValueFromEthAmount(borrowAssets);
+        }
+        // Session 35: Fee tier recalibrated based on Base competitor forensic analysis.
+        // Top 2 whale hunters (B949a5, 3d7BEe) median effective tip = 0.005 gwei.
+        // Our previous 2 gwei whale tier was 400x overkill. New tier: match competitors'
+        // baseline at 0.005 gwei, let headroom be allocated by max-fee cap. If we lose,
+        // investigate same-block reaction latency before increasing tip.
+        //
+        // Profit gate: $1 minimum (our operational cost ~$0.002/TX, so any profitable
+        // event is worth pursuing). Previously $100 implicit via no-bid on small tiers.
+        //
+        // Tier (USD borrow value → base tip):
+        //   <$10:        skip entirely (spray bot territory, pure noise)
+        //   $10–$100:    0.005 gwei (floor, match competitor median)
+        //   $100–$1K:    0.01 gwei
+        //   $1K–$10K:    0.02 gwei
+        //   $10K+:       0.05 gwei (10x floor, still 40x cheaper than old 2 gwei)
+        if (usd < 1) {
+          console.log(
+            `${this.logTag}Fast skip: profit gate (usd=${usd.toFixed(2)}) ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol}`,
+          );
+          return false;
+        }
+        // Canary gate (Phase 2): loss caps, collateral whitelist, stopped flag.
+        // Pass-through when canary is absent or disabled.
+        if (this.canary) {
+          const decision = this.canary.shouldAttempt({
+            collateralSymbol: pos.collateralSymbol,
+            expectedProfitUsd: usd,
+          });
+          if (!decision.allow) {
+            console.log(
+              `${this.logTag}Canary skip: ${decision.reason} ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol}`,
+            );
+            this.canary.recordResult({
+              timestamp: Date.now(),
+              eventDate: new Date().toISOString().slice(0, 10),
+              type: "skipped",
+              borrower: pos.borrower,
+              marketId: pos.marketId,
+              collateralSymbol: pos.collateralSymbol,
+              loanSymbol: pos.loanSymbol ?? "",
+              expectedProfitUsd: usd,
+              gasCostUsd: 0,
+              actualProfitUsd: 0,
+              skipReason: decision.reason,
+            });
+            return false;
+          }
+        }
+        const dynamicTip =
+          usd >= 10_000
+            ? 50_000_000n // 0.05 gwei
+            : usd >= 1_000
+              ? 20_000_000n // 0.02 gwei
+              : usd >= 100
+                ? 10_000_000n // 0.01 gwei
+                : 5_000_000n; // 0.005 gwei — competitor median baseline
+        // EIP-1559: maxFeePerGas must be >= baseFee + priorityFee.
+        // Sprint D1 (2026-04-11) confirmed Base baseFee can spike to 1+ gwei during
+        // congestion, causing rejects with the old per-tier maxFee values (0.2-0.5 gwei).
+        // Fix: unified 2 gwei maxFee across all tiers. This covers baseFee up to ~1.95 gwei
+        // (covers >99% of Base scenarios). Actual cost is still baseFee + tip (refund to
+        // that after landing), so the higher max-fee ceiling is free — it only affects
+        // the pre-send balance check.
+        //
+        // Wallet balance check: viem requires `balance >= gasLimit * maxFeePerGas`.
+        // At 2 gwei × 250K (upper gas bound) = 0.0005 ETH per TX. All wallets currently
+        // have 0.0007+ ETH, so the check passes.
+        const dynamicMaxFee = 2_000_000_000n; // 2 gwei (unified across tiers)
+        const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        let txHash: Hex;
+        const signStartMs = Date.now();
+        try {
+          txHash = await writeContract(this.client, {
+            address: encoder.address,
+            ...functionData,
+            maxPriorityFeePerGas: dynamicTip,
+            maxFeePerGas: dynamicMaxFee,
+            nonce,
+          });
+        } catch (error) {
+          this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
+          this.markPositionUsed(marketId, pos.borrower);
+          // Canary: record pre-broadcast failure as revert with minimal cost.
+          if (this.canary) {
+            const msg = error instanceof Error ? error.message : String(error);
+            this.canary.recordResult({
+              timestamp: Date.now(),
+              eventDate: new Date().toISOString().slice(0, 10),
+              type: "revert",
+              borrower: pos.borrower,
+              marketId: pos.marketId,
+              collateralSymbol: pos.collateralSymbol,
+              loanSymbol: pos.loanSymbol ?? "",
+              expectedProfitUsd: usd,
+              gasCostUsd: 0, // no on-chain gas — failed before broadcast
+              actualProfitUsd: 0,
+              priorityFeeGwei: Number(dynamicTip) / 1e9,
+              errorMessage: msg.slice(0, 200),
+            });
+          }
+          throw error;
+        }
+        const broadcastedMs = Date.now();
+
+        console.log(
+          `${this.logTag}⚡ OPTIMISTIC SENT ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol} tx=${txHash}`,
+        );
+        this.markPositionUsed(marketId, pos.borrower);
+        discord
+          .notifyTxFired(`${pos.collateralSymbol}/${pos.loanSymbol}`, pos.borrower, txHash, 0)
+          .catch(() => {});
+
+        // Canary: log broadcast as "attempt" (no counter update). Final P&L is
+        // recorded by verifyCanaryReceipt after receipt arrives.
+        if (this.canary) {
+          this.canary.recordResult({
+            timestamp: broadcastedMs,
+            eventDate: new Date(broadcastedMs).toISOString().slice(0, 10),
+            type: "attempt",
+            borrower: pos.borrower,
+            marketId: pos.marketId,
+            collateralSymbol: pos.collateralSymbol,
+            loanSymbol: pos.loanSymbol ?? "",
+            expectedProfitUsd: usd,
+            gasCostUsd: 0,
+            actualProfitUsd: 0,
+            txHash,
+            priorityFeeGwei: Number(dynamicTip) / 1e9,
+            signStartMs,
+            broadcastedMs,
+            latencyMs: broadcastedMs - signStartMs,
+          });
+
+          // Fire-and-forget receipt verification.
+          this.verifyCanaryReceipt(txHash, {
+            borrower: pos.borrower,
+            marketId: pos.marketId,
+            collateralSymbol: pos.collateralSymbol,
+            loanSymbol: pos.loanSymbol ?? "",
+            expectedProfitUsd: usd,
+            priorityFeeGwei: Number(dynamicTip) / 1e9,
+          }).catch((e: unknown) => {
+            console.log(
+              `${this.logTag}Canary receipt verify failed: ${e instanceof Error ? e.message : String(e)}`,
+            );
+          });
+        }
+        return true;
+      } else if (this.flashbotAccount) {
+        // ETH L1 with Flashbots — use simulation (reverts are expensive on L1)
+        const success = await this.handleTx(
+          encoder,
+          calls,
+          marketParams,
+          pos.borrower,
+          badDebtPosition,
+          false,
+          lease,
+        );
+        if (success) {
+          console.log(
+            `${this.logTag}FAST LIQUIDATED ${pos.borrower} on ${marketId} (${pos.collateralSymbol}/${pos.loanSymbol})`,
+          );
+        }
+        return success ?? false;
+      } else {
+        // Simple path — just send
+        const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        try {
+          await writeContract(this.client, { address: encoder.address, ...functionData, nonce });
+        } catch (error) {
+          this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
+          this.markPositionUsed(marketId, pos.borrower);
+          throw error;
+        }
+        this.markPositionUsed(marketId, pos.borrower);
+        console.log(
+          `${this.logTag}FAST LIQUIDATED ${pos.borrower} on ${marketId} (${pos.collateralSymbol}/${pos.loanSymbol})`,
+        );
+        return true;
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      // Reverts are expected and cheap ($0.001) — only log briefly
+      if (msg.includes("reverted") || msg.includes("revert")) {
+        console.log(
+          `${this.logTag}Fast revert ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol}: ${msg.slice(0, 500)}`,
+        );
+        discord
+          .notifyRevert(`${pos.collateralSymbol}/${pos.loanSymbol}`, msg.slice(0, 100))
+          .catch(() => {});
+      } else {
+        console.error(
+          `${this.logTag}Fast liquidate failed for ${pos.borrower}:`,
+          msg.slice(0, 120),
+        );
+      }
+      return false;
+    }
+  }
+
+  /** Cache for ERC20 decimals to avoid repeated RPC calls. */
+  private decimalsCache: Record<string, number> = {};
+
+  private async getDecimals(token: Address): Promise<number> {
+    const key = token.toLowerCase();
+    if (this.decimalsCache[key] !== undefined) return this.decimalsCache[key];
+    if (key === this.wNative.toLowerCase()) {
+      this.decimalsCache[key] = 18;
+      return 18;
+    }
+
+    const decimals = await readContract(this.client, {
+      address: token,
+      abi: erc20Abi,
+      functionName: "decimals",
+    });
+    this.decimalsCache[key] = decimals;
+    return decimals;
+  }
+
   private async liquidate(position: AccrualPosition) {
     const marketParams = position.market.params;
     const seizableCollateral = position.seizableCollateral ?? 0n;
@@ -118,10 +553,18 @@ export class LiquidationBot {
 
     if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) return;
 
-    const { client, executorAddress } = this;
+    const { executorAddress } = this;
+    const encoder = new LiquidationEncoder(executorAddress, this.client);
+    const morpho = this.chainAddresses.morpho;
+    const market = {
+      loanToken: marketParams.loanToken,
+      collateralToken: marketParams.collateralToken,
+      oracle: marketParams.oracle,
+      irm: marketParams.irm,
+      lltv: BigInt(marketParams.lltv),
+    };
 
-    const encoder = new LiquidationEncoder(executorAddress, client);
-
+    // Step 1: Build collateral→loan conversion calls
     if (
       !(await this.convertCollateralToLoan(
         marketParams,
@@ -130,29 +573,90 @@ export class LiquidationBot {
       ))
     )
       return;
+    const collateralToLoanCalls = encoder.flush();
 
-    encoder.erc20Approve(marketParams.loanToken, this.chainAddresses.morpho, maxUint256);
+    // Step 2: Flash loan repay amount = borrower's debt in LOAN TOKEN units
+    // position.borrowAssets is the borrower's debt denominated in loan token
+    // Add 1% buffer for interest accrual between query and execution
+    const repayAmount = (position.borrowAssets * 101n) / 100n;
 
+    // Step 3: Build flash loan liquidation
+    // Inner: approve + liquidate (with collateral→loan callback)
+    encoder.erc20Approve(marketParams.loanToken, morpho, 0n);
+    encoder.erc20Approve(marketParams.loanToken, morpho, maxUint256);
     encoder.morphoBlueLiquidate(
-      this.chainAddresses.morpho,
-      {
-        loanToken: marketParams.loanToken,
-        collateralToken: marketParams.collateralToken,
-        oracle: marketParams.oracle,
-        irm: marketParams.irm,
-        lltv: BigInt(marketParams.lltv),
-      },
+      morpho,
+      market,
       position.user,
-      seizableCollateral,
+      this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
       0n,
-      encoder.flush(),
+      collateralToLoanCalls,
     );
-    encoder.erc20Skim(marketParams.loanToken, this.treasuryAddress);
 
+    // Self-funding tip for WETH loan markets (25% of estimated profit)
+    const isWethLoan = marketParams.loanToken.toLowerCase() === this.wNative.toLowerCase();
+    const useSelfFundingTip = this.flashbotAccount !== undefined && !badDebtPosition && isWethLoan;
+    if (useSelfFundingTip) {
+      // Estimate profit: liquidation incentive ≈ 1/LLTV - 1 ≈ 15% for 86% LLTV
+      // Tip = 25% of estimated profit = repayAmount * ~15% * 25% ≈ repayAmount * 3.75%
+      const tipBps = this.tipBps ?? 2500n; // 25% of profit
+      const estimatedProfitWeth = (repayAmount * 1500n) / 10000n; // ~15% LIF margin
+      const dynamicTip = (estimatedProfitWeth * tipBps) / 10000n;
+      const MIN_TIP = parseUnits("0.001", 18);
+      const MAX_TIP = parseUnits("0.1", 18);
+      const tipAmount =
+        dynamicTip < MIN_TIP ? MIN_TIP : dynamicTip > MAX_TIP ? MAX_TIP : dynamicTip;
+      encoder.unwrapETH(this.wNative, tipAmount);
+      encoder.tip(tipAmount);
+    }
+
+    // Flush all callback calls for the flash loan
+    const flashLoanCallbackCalls = encoder.flush();
+
+    // Wrap in flash loan (zero capital needed)
+    // USDT and other non-standard ERC20 tokens don't work with Morpho flash loan
+    // (Morpho's safeTransferFrom callback fails with non-standard approve).
+    // Use Balancer flash loan instead (also 0% fee, USDT compatible).
+    const KNOWN_NON_STANDARD = new Set([
+      "0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT
+    ]);
+    const isNonStandard = KNOWN_NON_STANDARD.has(marketParams.loanToken.toLowerCase());
+
+    if (isNonStandard) {
+      const BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Address;
+      // For Balancer: rebuild callback with vault approval included
+      // flashLoanCallbackCalls already contains: approve(Morpho) + liquidate + tip
+      // We need to add: approve(Balancer vault) for repayment
+      // But we can't append to flushed calls — re-encode everything
+
+      // The flashLoanCallbackCalls are the inner operations.
+      // Balancer callback needs: inner ops + approve vault for pullback
+      encoder.erc20Approve(marketParams.loanToken, BALANCER_VAULT, 0n);
+      encoder.erc20Approve(marketParams.loanToken, BALANCER_VAULT, repayAmount);
+      const vaultApprovals = encoder.flush();
+
+      encoder.balancerFlashLoan(
+        BALANCER_VAULT,
+        [{ asset: marketParams.loanToken, amount: repayAmount }],
+        [...flashLoanCallbackCalls, ...vaultApprovals],
+      );
+    } else {
+      encoder.blueFlashLoan(morpho, marketParams.loanToken, repayAmount, flashLoanCallbackCalls);
+    }
+
+    // Skim remaining profit to treasury (after flash loan repayment)
+    encoder.erc20Skim(marketParams.loanToken, this.treasuryAddress);
     const calls = encoder.flush();
 
     try {
-      const success = await this.handleTx(encoder, calls, marketParams, badDebtPosition);
+      const success = await this.handleTx(
+        encoder,
+        calls,
+        marketParams,
+        position.user,
+        badDebtPosition,
+        useSelfFundingTip,
+      );
 
       if (success)
         console.log(
@@ -185,6 +689,7 @@ export class LiquidationBot {
 
     if (!(await this.convertCollateralToLoan(marketParams, seizableCollateral, encoder))) return;
 
+    encoder.erc20Approve(marketParams.loanToken, position.preLiquidation, 0n);
     encoder.erc20Approve(marketParams.loanToken, position.preLiquidation, maxUint256);
 
     encoder.preLiquidate(
@@ -199,7 +704,7 @@ export class LiquidationBot {
     const calls = encoder.flush();
 
     try {
-      const success = await this.handleTx(encoder, calls, marketParams, false);
+      const success = await this.handleTx(encoder, calls, marketParams, position.user, false);
 
       if (success)
         console.log(
@@ -221,7 +726,10 @@ export class LiquidationBot {
     encoder: LiquidationEncoder,
     calls: Hex[],
     marketParams: IMarketParams,
+    borrower: Address,
     badDebtPosition: boolean,
+    selfFundingTip = false,
+    existingLease?: PrimaryWalletLease,
   ) {
     const functionData = {
       abi: executorAbi,
@@ -274,22 +782,190 @@ export class LiquidationBot {
 
     // TX EXECUTION
 
-    if (this.flashbotAccount) {
-      const signedBundle = await Flashbots.signBundle([
-        {
-          transaction: { to: encoder.address, ...functionData },
-          client: this.client,
-        },
-      ]);
+    const marketId = MarketUtils.getMarketId(marketParams);
+    const lease = existingLease ?? this.primaryWalletCoordinator.tryAcquire(`handleTx:${marketId}`);
+    if (lease === null) {
+      console.log(`${this.logTag}handleTx: primary wallet busy — skipping ${marketId}`);
+      return false;
+    }
+    const shouldReleaseLease = existingLease === undefined;
 
-      await Flashbots.sendRawBundle(
-        signedBundle,
-        (await getBlockNumber(this.client)) + 1n,
-        this.flashbotAccount,
-      );
-      return true;
-    } else {
-      await writeContract(this.client, { address: encoder.address, ...functionData });
+    try {
+      if (this.flashbotAccount) {
+        const loanProfit = (results[2].result ?? 0n) - (results[0].result ?? 0n);
+        const estimatedGasCost = results[1].gasUsed * gasPrice;
+
+        // Parallel: fetch block + balance + prices simultaneously
+        const [block, walletBalance, loanPriceUsd, ethPriceUsd] = await Promise.all([
+          getBlock(this.client),
+          getBalance(this.client, { address: this.client.account.address }),
+          this.pricers && loanProfit > 0n && marketParams.loanToken !== this.wNative
+            ? this.price(marketParams.loanToken, loanProfit, this.pricers)
+            : Promise.resolve(undefined),
+          this.pricers ? this.price(this.wNative, WAD, this.pricers) : Promise.resolve(undefined),
+        ]);
+        const baseFee = block.baseFeePerGas ?? gasPrice;
+
+        // Determine tip: self-funding (encoded in TX) vs wallet-funded
+        let walletTip = 0n;
+
+        if (!selfFundingTip) {
+          let profitInEth = loanProfit;
+          if (loanPriceUsd !== undefined && ethPriceUsd !== undefined && ethPriceUsd > 0) {
+            profitInEth = BigInt(Math.floor((loanPriceUsd / ethPriceUsd) * 1e18));
+          }
+
+          const tipBps = this.tipBps ?? Flashbots.DEFAULT_TIP_BPS;
+          walletTip = Flashbots.calculateCoinbaseTip(profitInEth, tipBps);
+          walletTip = Flashbots.capTipToWalletBalance(walletTip, estimatedGasCost, walletBalance);
+
+          // Net profitability check including tip
+          if (this.pricers) {
+            const [tipCostUsd, gasCostUsd, grossProfitUsd] = await Promise.all([
+              this.price(this.wNative, walletTip, this.pricers),
+              this.price(this.wNative, estimatedGasCost, this.pricers),
+              this.price(marketParams.loanToken, loanProfit, this.pricers),
+            ]);
+
+            if (
+              grossProfitUsd !== undefined &&
+              tipCostUsd !== undefined &&
+              gasCostUsd !== undefined
+            ) {
+              const netProfitUsd = grossProfitUsd - tipCostUsd - gasCostUsd;
+              if (netProfitUsd <= 0) {
+                console.log(`${this.logTag}ℹ️ Skipped: net $${netProfitUsd.toFixed(2)}`);
+                return false;
+              }
+              console.log(`${this.logTag}💰 Net $${netProfitUsd.toFixed(2)}`);
+            }
+          }
+        }
+
+        // Sign the bundle once, send to ALL builders
+        const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        let signedBundle: Hex[];
+        let blockNumber: bigint;
+        try {
+          ({ signedBundle, blockNumber } = await Flashbots.signAndPrepareBundle(
+            { transaction: { to: encoder.address, ...functionData, nonce }, client: this.client },
+            this.flashbotAccount,
+            walletTip,
+            baseFee,
+          ));
+        } catch (error) {
+          this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
+          this.markPositionUsed(marketId, borrower);
+          throw error;
+        }
+
+        // Multi-builder submission: Flashbots + Titan + rsync + beaverbuild
+        if (this.multiBuilder) {
+          this.multiBuilder
+            .sendBundleToConsecutiveBlocks(signedBundle, blockNumber + 1n, 3)
+            .catch(() => {}); // fire-and-forget
+        } else {
+          // Fallback: single Flashbots relay
+          for (let i = 1; i <= 3; i++) {
+            Flashbots.sendRawBundle(
+              signedBundle,
+              blockNumber + BigInt(i),
+              this.flashbotAccount,
+            ).catch(() => {});
+          }
+        }
+
+        this.markPositionUsed(marketId, borrower);
+        return true;
+      } else if (this.useL2PriorityBidding && this.pricers) {
+        // L2 competitive bidding: fold tip into priority fee for sequencer priority
+        const loanProfit = (results[2].result ?? 0n) - (results[0].result ?? 0n);
+        if (loanProfit <= 0n) return false;
+
+        const estimatedGasCost = results[1].gasUsed * gasPrice;
+
+        const [block, walletBalance] = await Promise.all([
+          getBlock(this.client),
+          getBalance(this.client, { address: this.client.account.address }),
+        ]);
+        const baseFee = block.baseFeePerGas ?? gasPrice;
+
+        // Convert loan profit to ETH for tip calculation
+        let profitInEth = loanProfit;
+        if (marketParams.loanToken.toLowerCase() !== this.wNative.toLowerCase()) {
+          const [loanPriceUsd, ethPriceUsd] = await Promise.all([
+            this.price(marketParams.loanToken, loanProfit, this.pricers),
+            this.price(this.wNative, WAD, this.pricers),
+          ]);
+          if (loanPriceUsd !== undefined && ethPriceUsd !== undefined && ethPriceUsd > 0) {
+            profitInEth = BigInt(Math.floor((loanPriceUsd / ethPriceUsd) * 1e18));
+          }
+        }
+
+        // Calculate tip: 25% of profit (same as L1 Flashbots logic)
+        const tipBps = this.tipBps ?? 2500n;
+        let tip = (profitInEth * tipBps) / 10000n;
+
+        // Cap tip to 80% of wallet balance minus gas cost
+        const maxSpend = (walletBalance * 8000n) / 10000n;
+        if (tip + estimatedGasCost > maxSpend) {
+          tip = maxSpend > estimatedGasCost ? maxSpend - estimatedGasCost : 0n;
+        }
+
+        // Net profitability check including tip cost
+        const [tipCostUsd, gasCostUsd, grossProfitUsd] = await Promise.all([
+          this.price(this.wNative, tip, this.pricers),
+          this.price(this.wNative, estimatedGasCost, this.pricers),
+          this.price(marketParams.loanToken, loanProfit, this.pricers),
+        ]);
+
+        if (grossProfitUsd !== undefined && tipCostUsd !== undefined && gasCostUsd !== undefined) {
+          const netProfitUsd = grossProfitUsd - tipCostUsd - gasCostUsd;
+          if (netProfitUsd <= 0) {
+            console.log(`${this.logTag}ℹ️ L2 bid skip: net $${netProfitUsd.toFixed(2)} after tip`);
+            return false;
+          }
+          console.log(
+            `${this.logTag}💰 L2 bid: net $${netProfitUsd.toFixed(2)}, tip ${formatEther(tip)} ETH`,
+          );
+        }
+
+        // Fold tip into priority fee
+        const gasEstimate = results[1].gasUsed > 0n ? results[1].gasUsed : 1n;
+        const tipAsPriorityFee = tip > 0n ? tip / gasEstimate : 0n;
+        const L2_BASE_PRIORITY = parseGwei("0.001");
+        const effectivePriorityFee = tipAsPriorityFee + L2_BASE_PRIORITY;
+
+        const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        try {
+          await writeContract(this.client, {
+            address: encoder.address,
+            ...functionData,
+            maxPriorityFeePerGas: effectivePriorityFee,
+            maxFeePerGas: baseFee * 2n + effectivePriorityFee,
+            nonce,
+          });
+        } catch (error) {
+          this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
+          this.markPositionUsed(marketId, borrower);
+          throw error;
+        }
+
+        this.markPositionUsed(marketId, borrower);
+        return true;
+      } else {
+        const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        try {
+          await writeContract(this.client, { address: encoder.address, ...functionData, nonce });
+        } catch (error) {
+          this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
+          this.markPositionUsed(marketId, borrower);
+          throw error;
+        }
+        this.markPositionUsed(marketId, borrower);
+      }
+    } finally {
+      if (shouldReleaseLease) this.primaryWalletCoordinator.release(lease);
     }
 
     return true;
@@ -331,16 +1007,36 @@ export class LiquidationBot {
 
     if (price === undefined) return undefined;
 
-    const decimals =
-      asset === this.wNative
-        ? 18
-        : await readContract(this.client, {
-            address: asset,
-            abi: erc20Abi,
-            functionName: "decimals",
-          });
-
+    const decimals = await this.getDecimals(asset);
     return parseFloat(formatUnits(amount, decimals)) * price;
+  }
+
+  private async getEthUsdPriceScaled() {
+    try {
+      const ethUsd = this.pricers ? await this.price(this.wNative, WAD, this.pricers) : undefined;
+      if (ethUsd !== undefined && Number.isFinite(ethUsd) && ethUsd > 0) {
+        return BigInt(Math.round(ethUsd * Number(USD_SCALE)));
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `${this.logTag}ETH/USD pricing failed, using fallback ${ETH_USD_FALLBACK}: ${msg}`,
+      );
+      return ETH_USD_FALLBACK * USD_SCALE;
+    }
+
+    console.warn(`${this.logTag}ETH/USD pricer unavailable, using fallback ${ETH_USD_FALLBACK}`);
+    return ETH_USD_FALLBACK * USD_SCALE;
+  }
+
+  private async usdValueFromEthAmount(amountWei: bigint) {
+    const ethUsdScaled = await this.getEthUsdPriceScaled();
+    const usdScaled = (amountWei * ethUsdScaled) / WAD;
+    return Number(usdScaled) / Number(USD_SCALE);
+  }
+
+  private markPositionUsed(marketId: Hex, account: Address) {
+    this.positionLiquidationCooldownMechanism?.markPositionUsed(marketId, account);
   }
 
   private async checkProfit(
@@ -355,8 +1051,29 @@ export class LiquidationBot {
     },
     badDebtPosition: boolean,
   ) {
-    if (this.alwaysRealizeBadDebt && badDebtPosition) return true;
     if (this.pricers === undefined || this.pricers.length === 0) return true;
+
+    // Bad debt: only realize if profit covers gas, preventing dust waste.
+    // Without this, ALWAYS_REALIZE_BAD_DEBT=true would burn gas on $0.001 positions.
+    if (this.alwaysRealizeBadDebt && badDebtPosition) {
+      if (loanAssetBalance.beforeTx === undefined || loanAssetBalance.afterTx === undefined)
+        return false;
+
+      const profit = loanAssetBalance.afterTx - loanAssetBalance.beforeTx;
+      if (profit <= 0n) return false; // zero recovery — don't burn gas
+
+      const [profitUsd, gasCostUsd] = await Promise.all([
+        this.price(loanAsset, profit, this.pricers),
+        this.price(this.wNative, gas.used * gas.price, this.pricers),
+      ]);
+
+      // Only realize bad debt if profit exceeds gas cost
+      if (profitUsd !== undefined && gasCostUsd !== undefined) {
+        return profitUsd > gasCostUsd;
+      }
+      // If we can't price, skip to be safe (don't waste gas on unknown)
+      return false;
+    }
 
     if (loanAssetBalance.beforeTx === undefined || loanAssetBalance.afterTx === undefined)
       return false;
@@ -377,13 +1094,19 @@ export class LiquidationBot {
     return profitUsd > 0;
   }
 
-  private decreaseSeizableCollateral(seizableCollateral: bigint, badDebtPosition: boolean) {
-    if (badDebtPosition) return seizableCollateral;
-
+  private decreaseSeizableCollateral(seizableCollateral: bigint, _badDebtPosition: boolean) {
+    // Always apply buffer (bad-debt bypass removed).
+    // Morpho mulDivUp overflows when seizedAssets ~ total collateral on high-LLTV markets.
     const liquidationBufferBps =
       chainConfigs[this.chainId]?.options.liquidationBufferBps ?? DEFAULT_LIQUIDATION_BUFFER_BPS;
 
     return wMulDown(seizableCollateral, WAD - parseUnits(liquidationBufferBps.toString(), 14));
+  }
+
+  private capFastPathSeizableCollateral(pos: CachedPosition, seizableCollateral: bigint) {
+    if (pos.collateralSymbol !== "cbXRP") return seizableCollateral;
+
+    return (seizableCollateral * CBXRP_FAST_PATH_SEIZE_BPS) / BPS;
   }
 
   private checkCooldown(marketId: Hex, account: Address) {
@@ -411,5 +1134,87 @@ export class LiquidationBot {
     );
 
     this.coveredMarkets = [...whitelistedMarketsFromVaults, ...this.additionalMarketsWhitelist];
+    this.marketsFetchingCooldownMechanism.markFetchingDone();
+  }
+
+  /**
+   * Out-of-band canary receipt verifier. Called fire-and-forget after a
+   * successful writeContract broadcast. Waits up to 30s for receipt, then
+   * records the final outcome (pass/revert with real gas cost).
+   *
+   * Broadcast itself is logged as "attempt" (no counter change). Only this
+   * function records "pass" or "revert" with counter impact, so there is no
+   * double-counting.
+   */
+  private async verifyCanaryReceipt(
+    txHash: Hex,
+    ctx: {
+      borrower: Address;
+      marketId: Hex;
+      collateralSymbol: string;
+      loanSymbol: string;
+      expectedProfitUsd: number;
+      priorityFeeGwei: number;
+    },
+  ): Promise<void> {
+    if (!this.canary) return;
+
+    // Poll up to 30s for receipt.
+    const deadline = Date.now() + 30_000;
+    let receipt: Awaited<ReturnType<typeof getTransactionReceipt>> | null = null;
+    while (Date.now() < deadline) {
+      try {
+        receipt = await getTransactionReceipt(this.client, { hash: txHash });
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+
+    const nowMs = Date.now();
+    const eventDate = new Date(nowMs).toISOString().slice(0, 10);
+
+    if (!receipt) {
+      // Tx dropped or not mined. No on-chain gas cost.
+      this.canary.recordResult({
+        timestamp: nowMs,
+        eventDate,
+        type: "revert",
+        borrower: ctx.borrower,
+        marketId: ctx.marketId,
+        collateralSymbol: ctx.collateralSymbol,
+        loanSymbol: ctx.loanSymbol,
+        expectedProfitUsd: ctx.expectedProfitUsd,
+        gasCostUsd: 0,
+        actualProfitUsd: 0,
+        txHash,
+        priorityFeeGwei: ctx.priorityFeeGwei,
+        errorMessage: "receipt_timeout_30s",
+      });
+      return;
+    }
+
+    const gasUsed = receipt.gasUsed;
+    const effectiveGasPrice = receipt.effectiveGasPrice ?? 0n;
+    const gasCostWei = gasUsed * effectiveGasPrice;
+    const gasCostUsd = await this.usdValueFromEthAmount(gasCostWei);
+
+    const isSuccess = receipt.status === "success";
+    this.canary.recordResult({
+      timestamp: nowMs,
+      eventDate,
+      type: isSuccess ? "pass" : "revert",
+      borrower: ctx.borrower,
+      marketId: ctx.marketId,
+      collateralSymbol: ctx.collateralSymbol,
+      loanSymbol: ctx.loanSymbol,
+      expectedProfitUsd: ctx.expectedProfitUsd,
+      gasCostUsd,
+      actualProfitUsd: isSuccess ? ctx.expectedProfitUsd - gasCostUsd : -gasCostUsd,
+      txHash,
+      effectiveGasPriceGwei: Number(effectiveGasPrice) / 1e9,
+      priorityFeeGwei: ctx.priorityFeeGwei,
+      gasUsed: gasUsed.toString(),
+    });
   }
 }

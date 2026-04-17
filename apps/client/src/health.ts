@@ -1,6 +1,28 @@
 import type { FastifyInstance } from "fastify";
 import Fastify from "fastify";
 
+/** Global health state — updated by subsystems. */
+export const healthState: Record<string, any> = ((globalThis as any).__healthState ??= {
+  flashblockConnected: false,
+  // Initialize to Date.now() so lastEventSec stays bounded even if setter
+  // happens to not fire (observed after Session 35 canary wire-up — still
+  // investigating, but we don't want the health endpoint to page prematurely).
+  flashblockLastEventMs: Date.now(),
+  cexPredictorConnected: false,
+  positionCacheLastUpdateMs: 0,
+  positionCacheCount: 0,
+  txCacheBuiltCount: 0,
+  txCacheTotalAtRisk: 0,
+  walletBalanceWei: 0n,
+  uptimeMs: Date.now(),
+  lastLiquidationAttemptMs: 0,
+  errors429Count: 0,
+});
+
+export function setFlashblockLastEventMs(ms: number): void {
+  healthState.flashblockLastEventMs = ms;
+}
+
 class HealthServer {
   private fastify: FastifyInstance;
   private port: number;
@@ -9,16 +31,41 @@ class HealthServer {
   constructor(port = 3000, host = "0.0.0.0") {
     this.port = port;
     this.host = host;
-    this.fastify = Fastify({
-      logger: false,
-    });
-
+    this.fastify = Fastify({ logger: false });
     this.setupRoutes();
   }
 
   private setupRoutes() {
-    this.fastify.get("/health", async (request, reply) => {
-      return reply.code(200).send({ status: "ok" });
+    // Simple health check
+    this.fastify.get("/health", async (_request, reply) => {
+      const now = Date.now();
+      const fbStale = now - healthState.flashblockLastEventMs > 600_000; // 10min
+      const pcStale = now - healthState.positionCacheLastUpdateMs > 120_000; // 2min
+      const critical = fbStale || !healthState.flashblockConnected;
+
+      const status = critical ? "degraded" : "ok";
+      const code = critical ? 503 : 200;
+
+      return reply.code(code).send({
+        status,
+        uptime: Math.floor((now - healthState.uptimeMs) / 1000),
+        flashblock: {
+          connected: healthState.flashblockConnected,
+          lastEventSec: Math.floor((now - healthState.flashblockLastEventMs) / 1000),
+          stale: fbStale,
+        },
+        cexPredictor: { connected: healthState.cexPredictorConnected },
+        positionCache: {
+          count: healthState.positionCacheCount,
+          lastUpdateSec: Math.floor((now - healthState.positionCacheLastUpdateMs) / 1000),
+          stale: pcStale,
+        },
+        txCache: {
+          built: healthState.txCacheBuiltCount,
+          totalAtRisk: healthState.txCacheTotalAtRisk,
+        },
+        errors429: healthState.errors429Count,
+      });
     });
   }
 
@@ -37,7 +84,6 @@ class HealthServer {
   }
 }
 
-// Singleton instance
 let healthServerInstance: HealthServer | null = null;
 
 export function getHealthServer(port?: number, host?: string): HealthServer {

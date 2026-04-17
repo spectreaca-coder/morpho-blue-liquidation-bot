@@ -1,3 +1,4 @@
+export * from "./aerodromeV3";
 export * from "./erc20Wrapper";
 export * from "./uniswapV3";
 export * from "./uniswapV4";
