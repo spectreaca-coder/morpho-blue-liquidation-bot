@@ -5,7 +5,21 @@ import tseslint from "typescript-eslint";
 import eslintPluginImportX from "eslint-plugin-import-x";
 import eslintPluginPrettierRecommended from "eslint-plugin-prettier/recommended";
 
-export default tseslint.config({ ignores: ["**/dist/**", "apps/hyperindex/**"] }, eslint.configs.recommended, {
+export default tseslint.config({ ignores: [
+  "**/dist/**",
+  "apps/hyperindex/**",
+  // Dead code (per MEMORY.md — real config is in @morpho-blue-liquidation-bot/config)
+  "apps/client/src/config.ts",
+  // Untracked dev/scratch files — kept locally but excluded from lint
+  "apps/client/anvil-*.ts",
+  "apps/client/e2e-*.ts",
+  "apps/client/close-position.ts",
+  "apps/client/self-liquidation-test.ts",
+  "apps/client/setup-*.ts",
+  "apps/client/test-*.ts",
+  "apps/client/src/e2e-*.ts",
+  "apps/client/src/test-*.ts",
+] }, eslint.configs.recommended, {
   extends: [
     tseslint.configs.strictTypeChecked,
     tseslint.configs.stylisticTypeChecked,
