@@ -509,7 +509,8 @@ export class FlashblockHandler {
                 const usd = estimateBorrowUsd(prebuilt);
                 const decision = this.canary.shouldAttempt({
                   collateralSymbol: prebuilt.collateralSymbol,
-                  expectedProfitUsd: usd,
+                  expectedBorrowUsd: usd,
+                  lltvWad: prebuilt.lltv,
                 });
                 if (!decision.allow) {
                   console.log(
@@ -523,7 +524,9 @@ export class FlashblockHandler {
                     marketId: prebuilt.marketId,
                     collateralSymbol: prebuilt.collateralSymbol,
                     loanSymbol: prebuilt.loanSymbol ?? "",
-                    expectedProfitUsd: usd,
+                    expectedBorrowUsd: usd,
+                    lltvWad: prebuilt.lltv,
+                    estimatedProfitUsd: 0,
                     gasCostUsd: 0,
                     actualProfitUsd: 0,
                     skipReason: decision.reason,
@@ -638,7 +641,9 @@ export class FlashblockHandler {
                       marketId: prebuilt.marketId,
                       collateralSymbol: prebuilt.collateralSymbol,
                       loanSymbol: prebuilt.loanSymbol ?? "",
-                      expectedProfitUsd: usd,
+                      expectedBorrowUsd: usd,
+                      lltvWad: prebuilt.lltv,
+                      estimatedProfitUsd: 0,
                       gasCostUsd: 0,
                       actualProfitUsd: 0,
                       txHash: txHash as Hex,
@@ -767,21 +772,23 @@ export class FlashblockHandler {
               return true;
             });
           }
-          for (const c of activeMisses) {
-            this.bot
-              .fastLiquidate(c.position, c.seizableCollateral, c.borrowAssets)
-              .catch((e: unknown) => {
-                console.error(
-                  `${this.logTag}Fast liquidate error:`,
-                  e instanceof Error ? e.message : e,
-                );
-              })
-              .finally(() =>
-                this.inFlightBorrowers.delete(
-                  `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+          await Promise.allSettled(
+            activeMisses.map((c) =>
+              this.bot
+                .fastLiquidate(c.position, c.seizableCollateral, c.borrowAssets)
+                .catch((e: unknown) => {
+                  console.error(
+                    `${this.logTag}Fast liquidate error:`,
+                    e instanceof Error ? e.message : e,
+                  );
+                })
+                .finally(() =>
+                  this.inFlightBorrowers.delete(
+                    `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+                  ),
                 ),
-              );
-          }
+            ),
+          );
         })()
           .catch((e: unknown) => {
             console.error(
@@ -920,7 +927,7 @@ export class FlashblockHandler {
   private async verifyBatchReceipt(
     txHash: Hex,
     prebuilt: PrebuiltTx,
-    expectedProfitUsd: number,
+    expectedBorrowUsd: number,
   ): Promise<void> {
     if (!this.canary) return;
     const deadline = Date.now() + 30_000;
@@ -947,7 +954,9 @@ export class FlashblockHandler {
         marketId: prebuilt.marketId,
         collateralSymbol: prebuilt.collateralSymbol,
         loanSymbol: prebuilt.loanSymbol ?? "",
-        expectedProfitUsd,
+        expectedBorrowUsd,
+        lltvWad: prebuilt.lltv,
+        estimatedProfitUsd: 0,
         gasCostUsd: 0,
         actualProfitUsd: 0,
         txHash,
@@ -974,9 +983,11 @@ export class FlashblockHandler {
       marketId: prebuilt.marketId,
       collateralSymbol: prebuilt.collateralSymbol,
       loanSymbol: prebuilt.loanSymbol ?? "",
-      expectedProfitUsd,
+      expectedBorrowUsd,
+      lltvWad: prebuilt.lltv,
+      estimatedProfitUsd: 0,
       gasCostUsd,
-      actualProfitUsd: isSuccess ? expectedProfitUsd - gasCostUsd : -gasCostUsd,
+      actualProfitUsd: isSuccess ? expectedBorrowUsd - gasCostUsd : -gasCostUsd,
       txHash,
       effectiveGasPriceGwei: Number(effectiveGasPrice) / 1e9,
       gasUsed: gasUsed.toString(),

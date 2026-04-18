@@ -272,23 +272,24 @@ export function calculateTriggerPrice(
   loanDecimals: number,
 ): { triggerOraclePrice: bigint; triggerCexPrice: number } {
   const WAD = 10n ** 18n;
+  const ORACLE_PRICE_SCALE = WAD * WAD;
 
   if (collateral === 0n || lltv === 0n) {
     return { triggerOraclePrice: 0n, triggerCexPrice: 0 };
   }
 
   // triggerOraclePrice = borrowAssets * WAD / (collateral * LLTV / WAD)
-  // Simplified: triggerOraclePrice = borrowAssets * WAD * WAD / (collateral * LLTV)
-  const triggerOraclePrice = (borrowAssets * WAD * WAD) / (collateral * lltv);
+  // Simplified with Morpho's 1e36 oracle scale: borrowAssets * scale * WAD / (collateral * LLTV)
+  // Sanity check: 30,000 USDC borrow, 1 cbBTC collateral, 86% LLTV => triggerCexPrice ~= $34,883.
+  const scale = oracleScaleFactor === 0n ? ORACLE_PRICE_SCALE : oracleScaleFactor;
+  const triggerOraclePrice = (borrowAssets * scale * WAD) / (collateral * lltv);
 
   // Convert oracle price to CEX USD price
   // Oracle price is in 36-decimal format: price * 10^(36 + loanDecimals - collateralDecimals)
   // CEX price is simple USD float
   // triggerCexPrice = triggerOraclePrice / 10^(36 + loanDecimals - collateralDecimals)
-  const decimalShift = 36 + loanDecimals - collateralDecimals;
-
-  // oracleScaleFactor is accepted for future use (e.g. non-standard oracle configurations)
-  void oracleScaleFactor;
+  const scaleDigits = scale.toString().length - 1;
+  const decimalShift = scaleDigits + loanDecimals - collateralDecimals;
 
   const triggerCexPrice = Number(triggerOraclePrice) / 10 ** decimalShift;
 

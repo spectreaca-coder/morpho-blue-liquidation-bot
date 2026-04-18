@@ -39,6 +39,8 @@ export interface SelfFundingTipParams {
   borrower: Address;
   /** Collateral to seize (after buffer reduction). */
   seizableCollateral: bigint;
+  /** Decimals of collateral token (18 for WETH/cbETH, 8 for cbBTC/WBTC). */
+  collateralDecimals: number;
   /** Treasury address to receive remaining profit. */
   treasury: Address;
   /** Uniswap V3 fee tier for loanToken -> WETH swap (default: 3000 = 0.3%). */
@@ -143,13 +145,14 @@ export function encodeSelfFundingTip(
     market,
     borrower,
     seizableCollateral,
+    collateralDecimals,
     treasury,
     swapFeeTier = DEFAULT_UNI_FEE,
     tipOverride,
     liquidationCallbackCalls,
   } = params;
 
-  const tipAmount = estimateTipAmount(seizableCollateral, tipOverride);
+  const tipAmount = estimateTipAmount(seizableCollateral, collateralDecimals, tipOverride);
   const isWethLoan = market.loanToken.toLowerCase() === weth.toLowerCase();
 
   if (isWethLoan) {

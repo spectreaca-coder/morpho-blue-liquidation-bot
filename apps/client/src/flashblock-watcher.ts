@@ -572,10 +572,12 @@ export class FlashblockWatcher {
         const detected = this.detectOracleUpdate(tx.input);
         if (!detected) return;
         this.onOracleUpdate({
-          aggregatorAddress: detected.aggregator,
-          rawPrice: detected.price,
+          aggregatorAddress: ("0x" + detected) as `0x${string}`,
           blockNumber: tx.blockNumber ? parseInt(tx.blockNumber, 16) : 0,
-          source: "alchemy",
+          flashblockIndex: 0,
+          detectedAt: new Date().toISOString(),
+          rawTx: tx.input,
+          extractedPrice: undefined,
         });
         // Do NOT touch lastFlashblockMessageMs here — a healthy Alchemy stream must not
         // mask a dead primary flashblock stream from the heartbeat.

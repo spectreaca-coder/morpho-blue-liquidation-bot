@@ -108,6 +108,7 @@ export interface PrebuiltTx {
   marketId: Hex;
   collateralSymbol: string;
   loanSymbol: string;
+  lltv: bigint;
   /** Encoded executor calls ready for exec_606BaXt(calls). */
   calls: Hex[];
   borrowAssets: bigint;
@@ -551,6 +552,7 @@ export class TxCache {
       marketId: pos.marketId,
       collateralSymbol: pos.collateralSymbol,
       loanSymbol: pos.loanSymbol,
+      lltv: pos.lltv,
       calls,
       borrowAssets,
       seizableCollateral,

@@ -15,7 +15,8 @@ import {
 } from "viem";
 import { readContract } from "viem/actions";
 
-import { uniswapV3FactoryAbi, uniswapV3PoolAbi } from "../abis/uniswapV3";
+import { aerodromeSlipstreamFactoryAbi } from "../abis/aerodromeV3";
+import { uniswapV3PoolAbi } from "../abis/uniswapV3";
 import type { LiquidityVenue } from "../liquidityVenue";
 import type { ToConvert } from "../types";
 
@@ -135,7 +136,7 @@ export class AerodromeV3Venue implements LiquidityVenue {
           AERODROME_TICK_SPACINGS.map(async (tickSpacing) =>
             readContract(encoder.client, {
               address: factoryAddress,
-              abi: uniswapV3FactoryAbi,
+              abi: aerodromeSlipstreamFactoryAbi,
               functionName: "getPool",
               args: [src, dst, tickSpacing],
             }),

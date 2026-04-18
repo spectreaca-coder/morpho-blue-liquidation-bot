@@ -45,6 +45,26 @@ export interface CanaryConfig {
 
 export type CanaryEventType = "attempt" | "pass" | "revert" | "skipped";
 
+/**
+ * Morpho Blue liquidation incentive factor.
+ * Docs: https://docs.morpho.org/learn/concepts/liquidation/
+ * LIF(lltv) = min(1.15, 1 / (0.3 * lltv + 0.7)), with lltv expressed on [0, 1].
+ */
+export function estimateLiquidationBonusFactor(lltvWad: bigint): number {
+  const BETA = 0.3;
+  const MAX_LIF = 1.15;
+
+  if (lltvWad === 0n) return 1.0;
+
+  const lltv = Number(lltvWad) / 1e18;
+  const lif = 1 / (BETA * lltv + (1 - BETA));
+  return Math.min(MAX_LIF, lif);
+}
+
+function estimateLiquidationProfitUsd(expectedBorrowUsd: number, lltvWad: bigint): number {
+  return expectedBorrowUsd * (estimateLiquidationBonusFactor(lltvWad) - 1);
+}
+
 export interface CanaryEventRecord {
   /** Epoch ms of record creation. */
   timestamp: number;
@@ -55,10 +75,15 @@ export interface CanaryEventRecord {
   marketId: string;
   collateralSymbol: string;
   loanSymbol: string;
-  expectedProfitUsd: number;
+  /** Raw borrow notional in USD. Estimated profit is derived from this and LLTV. */
+  expectedBorrowUsd: number;
+  /** Morpho market LLTV in WAD units (1e18). */
+  lltvWad: bigint;
+  /** Estimated liquidation profit before gas, derived from expectedBorrowUsd and LLTV. */
+  estimatedProfitUsd: number;
   /** Actual gas cost paid for this attempt (USD). 0 for skipped. */
   gasCostUsd: number;
-  /** Net P&L: expectedProfit - gasCost on pass, -gasCost on revert, 0 on skip. */
+  /** Net P&L: estimatedProfit - gasCost on pass, -gasCost on revert, 0 on skip/attempt. */
   actualProfitUsd: number;
   /** On-chain tx hash if broadcasted. */
   txHash?: string;
@@ -70,6 +95,8 @@ export interface CanaryEventRecord {
   gasUsed?: string;
   /** Epoch ms of flashblock event reception. */
   flashblockReceivedMs?: number;
+  /** Epoch ms when signing started. */
+  signStartMs?: number;
   /** Epoch ms when writeContract returned (broadcast complete). */
   broadcastedMs?: number;
   /** Flashblock → broadcast delta (ms). */
@@ -151,7 +178,8 @@ export class CanaryTracker {
    */
   shouldAttempt(params: {
     collateralSymbol: string;
-    expectedProfitUsd: number;
+    expectedBorrowUsd: number;
+    lltvWad: bigint;
   }): CanaryAllowDecision {
     if (this.state.stopped) {
       return { allow: false, reason: `canary stopped: ${this.state.stoppedReason ?? "unknown"}` };
@@ -161,10 +189,15 @@ export class CanaryTracker {
       return { allow: true };
     }
 
-    if (params.expectedProfitUsd < this.config.minProfitGateUsd) {
+    const estimatedProfitUsd = estimateLiquidationProfitUsd(
+      params.expectedBorrowUsd,
+      params.lltvWad,
+    );
+
+    if (estimatedProfitUsd < this.config.minProfitGateUsd) {
       return {
         allow: false,
-        reason: `profit gate: $${params.expectedProfitUsd.toFixed(2)} < $${this.config.minProfitGateUsd}`,
+        reason: `profit gate: $${estimatedProfitUsd.toFixed(2)} < $${this.config.minProfitGateUsd}`,
       };
     }
 
@@ -210,9 +243,10 @@ export class CanaryTracker {
    * Skipped events are logged but do not mutate financial counters.
    */
   recordResult(record: CanaryEventRecord): void {
-    this.appendToLog(record);
+    const normalizedRecord = this.normalizeRecord(record);
+    this.appendToLog(normalizedRecord);
 
-    if (record.type === "skipped") {
+    if (normalizedRecord.type === "skipped") {
       this.state.totalSkipped += 1;
       this.saveState();
       return;
@@ -220,29 +254,27 @@ export class CanaryTracker {
 
     // "attempt" is logged-only (optimistic broadcast). Final counters wait for
     // receipt verification which fires a "pass" or "revert" record.
-    if (record.type === "attempt") {
+    if (normalizedRecord.type === "attempt") {
       return;
     }
 
     this.state.totalAttempts += 1;
 
-    if (record.type === "pass") {
+    if (normalizedRecord.type === "pass") {
       this.state.totalPass += 1;
-    } else if (record.type === "revert") {
+    } else if (normalizedRecord.type === "revert") {
       this.state.totalRevert += 1;
     }
 
-    // actualProfitUsd should already encode the net (profit - gas) for pass,
-    // or -gasCost for revert. Trust caller.
-    this.state.cumulativeProfitUsd += record.actualProfitUsd;
-    this.state.cumulativeGasSpentUsd += record.gasCostUsd;
+    this.state.cumulativeProfitUsd += normalizedRecord.actualProfitUsd;
+    this.state.cumulativeGasSpentUsd += normalizedRecord.gasCostUsd;
 
-    const date = record.eventDate;
-    const weekStart = this.getWeekStart(record.timestamp);
+    const date = normalizedRecord.eventDate;
+    const weekStart = this.getWeekStart(normalizedRecord.timestamp);
     this.state.dailyGasSpentUsd[date] =
-      (this.state.dailyGasSpentUsd[date] ?? 0) + record.gasCostUsd;
+      (this.state.dailyGasSpentUsd[date] ?? 0) + normalizedRecord.gasCostUsd;
     this.state.weeklyGasSpentUsd[weekStart] =
-      (this.state.weeklyGasSpentUsd[weekStart] ?? 0) + record.gasCostUsd;
+      (this.state.weeklyGasSpentUsd[weekStart] ?? 0) + normalizedRecord.gasCostUsd;
 
     // Emergency stop after update.
     const currentLoss = -this.state.cumulativeProfitUsd;
@@ -330,10 +362,44 @@ export class CanaryTracker {
   private appendToLog(record: CanaryEventRecord): void {
     try {
       mkdirSync(dirname(this.config.resultLogPath), { recursive: true });
-      appendFileSync(this.config.resultLogPath, JSON.stringify(record) + "\n", "utf8");
+      appendFileSync(
+        this.config.resultLogPath,
+        JSON.stringify(record, (_key, value) =>
+          typeof value === "bigint" ? value.toString() : value,
+        ) + "\n",
+        "utf8",
+      );
     } catch (e) {
       console.error(`[canary] failed to log result: ${(e as Error).message}`);
     }
+  }
+
+  private normalizeRecord(record: CanaryEventRecord): CanaryEventRecord {
+    const estimatedProfitUsd = estimateLiquidationProfitUsd(
+      record.expectedBorrowUsd,
+      record.lltvWad,
+    );
+
+    if (record.type === "pass") {
+      return {
+        ...record,
+        estimatedProfitUsd,
+        actualProfitUsd: estimatedProfitUsd - record.gasCostUsd,
+      };
+    }
+
+    if (record.type === "revert") {
+      return {
+        ...record,
+        estimatedProfitUsd,
+        actualProfitUsd: -record.gasCostUsd,
+      };
+    }
+
+    return {
+      ...record,
+      estimatedProfitUsd,
+    };
   }
 
   private getToday(): string {

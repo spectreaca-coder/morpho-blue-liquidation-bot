@@ -372,7 +372,8 @@ export class LiquidationBot {
         if (this.canary) {
           const decision = this.canary.shouldAttempt({
             collateralSymbol: pos.collateralSymbol,
-            expectedProfitUsd: usd,
+            expectedBorrowUsd: usd,
+            lltvWad: pos.lltv,
           });
           if (!decision.allow) {
             console.log(
@@ -386,7 +387,9 @@ export class LiquidationBot {
               marketId: pos.marketId,
               collateralSymbol: pos.collateralSymbol,
               loanSymbol: pos.loanSymbol ?? "",
-              expectedProfitUsd: usd,
+              expectedBorrowUsd: usd,
+              lltvWad: pos.lltv,
+              estimatedProfitUsd: 0,
               gasCostUsd: 0,
               actualProfitUsd: 0,
               skipReason: decision.reason,
@@ -439,7 +442,9 @@ export class LiquidationBot {
               marketId: pos.marketId,
               collateralSymbol: pos.collateralSymbol,
               loanSymbol: pos.loanSymbol ?? "",
-              expectedProfitUsd: usd,
+              expectedBorrowUsd: usd,
+              lltvWad: pos.lltv,
+              estimatedProfitUsd: 0,
               gasCostUsd: 0, // no on-chain gas — failed before broadcast
               actualProfitUsd: 0,
               priorityFeeGwei: Number(dynamicTip) / 1e9,
@@ -481,7 +486,9 @@ export class LiquidationBot {
             marketId: pos.marketId,
             collateralSymbol: pos.collateralSymbol,
             loanSymbol: pos.loanSymbol ?? "",
-            expectedProfitUsd: usd,
+            expectedBorrowUsd: usd,
+            lltvWad: pos.lltv,
+            estimatedProfitUsd: 0,
             gasCostUsd: 0,
             actualProfitUsd: 0,
             txHash,
@@ -497,7 +504,8 @@ export class LiquidationBot {
             marketId: pos.marketId,
             collateralSymbol: pos.collateralSymbol,
             loanSymbol: pos.loanSymbol ?? "",
-            expectedProfitUsd: usd,
+            expectedBorrowUsd: usd,
+            lltvWad: pos.lltv,
             priorityFeeGwei: Number(dynamicTip) / 1e9,
           }).catch((e: unknown) => {
             console.log(
@@ -1265,7 +1273,8 @@ export class LiquidationBot {
       marketId: Hex;
       collateralSymbol: string;
       loanSymbol: string;
-      expectedProfitUsd: number;
+      expectedBorrowUsd: number;
+      lltvWad: bigint;
       priorityFeeGwei: number;
     },
   ): Promise<void> {
@@ -1296,7 +1305,9 @@ export class LiquidationBot {
         marketId: ctx.marketId,
         collateralSymbol: ctx.collateralSymbol,
         loanSymbol: ctx.loanSymbol,
-        expectedProfitUsd: ctx.expectedProfitUsd,
+        expectedBorrowUsd: ctx.expectedBorrowUsd,
+        lltvWad: ctx.lltvWad,
+        estimatedProfitUsd: 0,
         gasCostUsd: 0,
         actualProfitUsd: 0,
         txHash,
@@ -1320,9 +1331,11 @@ export class LiquidationBot {
       marketId: ctx.marketId,
       collateralSymbol: ctx.collateralSymbol,
       loanSymbol: ctx.loanSymbol,
-      expectedProfitUsd: ctx.expectedProfitUsd,
+      expectedBorrowUsd: ctx.expectedBorrowUsd,
+      lltvWad: ctx.lltvWad,
+      estimatedProfitUsd: 0,
       gasCostUsd,
-      actualProfitUsd: isSuccess ? ctx.expectedProfitUsd - gasCostUsd : -gasCostUsd,
+      actualProfitUsd: isSuccess ? ctx.expectedBorrowUsd - gasCostUsd : -gasCostUsd,
       txHash,
       effectiveGasPriceGwei: Number(effectiveGasPrice) / 1e9,
       priorityFeeGwei: ctx.priorityFeeGwei,
