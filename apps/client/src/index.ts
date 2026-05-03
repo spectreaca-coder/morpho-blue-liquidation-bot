@@ -284,32 +284,37 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
       quoteGateEnabled: config.quoteGateEnabled,
       quoteRaceEnabled: config.quoteRaceEnabled,
       quoteGateBufferBps: config.quoteGateBufferBps,
-      onBuildComplete: harnessPollEnabled
-        ? async (prebuilt) => {
-            const nonce = await primaryWalletCoordinator.reserveNonce(
-              `harness-presign:${prebuilt.borrower.toLowerCase()}:${prebuilt.marketId}`,
-              30_000,
-            );
-            const { maxFeePerGas, maxPriorityFeePerGas } = await getPollGasParams(
-              primaryWalletCoordinator.client,
-              prebuilt,
-            );
-            try {
-              await preSigner.presign(
-                prebuilt.borrower,
-                prebuilt.marketId,
-                TxCache.encodeCalldata(prebuilt),
-                nonce,
-                POLL_GAS_LIMIT,
-                maxFeePerGas,
-                maxPriorityFeePerGas,
-              );
-            } catch (error) {
-              primaryWalletCoordinator.releaseReservedNonce(nonce);
-              throw error;
-            }
-          }
-        : undefined,
+      // Pre-sign every freshly built TX into PreSigner cache. Additive — does
+      // not submit. Was previously gated by `harnessPollEnabled` (= false in
+      // prod), which left the cache permanently empty and made every fast-path
+      // hit `cold_no_cache`. Identical silent-failure pattern as the
+      // ORACLE_TO_CEX_MAP bug (commit c669e77): a dev/test toggle baked into
+      // the production wire. Verified 2026-05-04 — fix unblocks PreSigner cache
+      // for FlashblockHandler, poll-liquidation-trigger, and CEX ARM #1.
+      onBuildComplete: async (prebuilt) => {
+        const nonce = await primaryWalletCoordinator.reserveNonce(
+          `presign:${prebuilt.borrower.toLowerCase()}:${prebuilt.marketId}`,
+          30_000,
+        );
+        const { maxFeePerGas, maxPriorityFeePerGas } = await getPollGasParams(
+          primaryWalletCoordinator.client,
+          prebuilt,
+        );
+        try {
+          await preSigner.presign(
+            prebuilt.borrower,
+            prebuilt.marketId,
+            TxCache.encodeCalldata(prebuilt),
+            nonce,
+            POLL_GAS_LIMIT,
+            maxFeePerGas,
+            maxPriorityFeePerGas,
+          );
+        } catch (error) {
+          primaryWalletCoordinator.releaseReservedNonce(nonce);
+          throw error;
+        }
+      },
     });
     const stopMorphoWatcher = startMorphoEventWatcher({
       chainId: config.chainId,
