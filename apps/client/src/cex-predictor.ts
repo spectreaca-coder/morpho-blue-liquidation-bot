@@ -30,21 +30,29 @@ const wsReady = import("ws").then((mod) => {
 // Coinbase WS (US-accessible, Coinbase blocked from US IPs)
 const COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com";
 
-// Map Chainlink feed addresses on Base to Coinbase trading pairs
-// These are the BASE_FEED_1 addresses from MorphoChainlinkOracleV2
+// Map MorphoChainlinkOracleV2 instance addresses to Coinbase trading pairs.
+// Keys MUST be the per-market `oracleAddress` returned by the Morpho Blue API
+// (lowercased), NOT the inner Chainlink BASE_FEED_1. Lookup site:
+// `index.ts` does `ORACLE_TO_CEX_MAP[item.market.oracleAddress.toLowerCase()]`.
+// Verified 2026-05-04 via blue-api.morpho.org GraphQL `markets(uniqueKey_in: ...)`.
+// Stable-loan markets only (loan = USDC/USDT) — ratio markets like wrsETH/WETH
+// are skipped because their oracle does not reflect a USD price.
 export const ORACLE_TO_CEX_MAP: Record<string, { pair: string; symbol: string }> = {
-  // cbBTC/USDC market — BASE_FEED_1 = BTC/USD Chainlink
-  "0x64c911996d3c6ac71f9b455b1e8e7266bcbd848f": { pair: "BTC-USD", symbol: "BTC" },
-  // cbXRP/USDC market — BASE_FEED_1 = XRP/USD Chainlink
-  "0x9f0c1dd78c4cbdf5b9cf923a549a201edc676d34": { pair: "XRP-USD", symbol: "XRP" },
-  // WETH/USDC market — BASE_FEED_1 = ETH/USD Chainlink
-  "0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70": { pair: "ETH-USD", symbol: "ETH" },
-  // cbADA/USDC market — BASE_FEED_1 = ADA/USD Chainlink
-  "0x34cd971a092d5411bd69c10a5f0a7eef72c69041": { pair: "ADA-USD", symbol: "ADA" },
-  // cbLTC/USDC market — BASE_FEED_1 = LTC/USD Chainlink
-  "0x206a34e47093125fbf4c75b7c7e88b84c6a77a69": { pair: "LTC-USD", symbol: "LTC" },
-  // cbETH/USDC market — BASE_FEED_1 = ETH/USD (cbETH tracks ETH)
-  "0x806b4ac04501c29769051e42783cf04dce41440b": { pair: "ETH-USD", symbol: "ETH" },
+  // === Base (chainId 8453) — verified 2026-05-04 ===
+  // cbBTC/USDC (uniqueKey 0x9103c3b4...)
+  "0x663becd10dae6c4a3dcd89f1d76c1174199639b9": { pair: "BTC-USD", symbol: "BTC" },
+  // WETH/USDC (uniqueKey 0x8793cf30...)
+  "0xfea2d58cefcb9fcb597723c6bae66ffe4193afe4": { pair: "ETH-USD", symbol: "ETH" },
+  // cbXRP/USDC (uniqueKey 0xd4a903dc...)
+  "0x031b2efc8d70042ac8d9f5c793c4149ec4b60fde": { pair: "XRP-USD", symbol: "XRP" },
+  // cbADA/USDC (uniqueKey 0xd7520ad1...)
+  "0x35d87a743d1f2f7cafb42d855dc1c5df857ce45f": { pair: "ADA-USD", symbol: "ADA" },
+  // cbLTC/USDC (uniqueKey 0x9125d0fa...)
+  "0x47f961e6653423a77b1ef8fb680ee53bf7d8a00d": { pair: "LTC-USD", symbol: "LTC" },
+  // cbETH/USDC primary (uniqueKey 0x1c21c59d...)
+  "0xb40d93f44411d8c09ad17d7f88195ef9b05ccd96": { pair: "ETH-USD", symbol: "ETH" },
+  // cbETH/USDC alt (uniqueKey 0x0ca10126...)
+  "0x97ff9cbd7e77348b2b8ffbb883bf29452ad18295": { pair: "ETH-USD", symbol: "ETH" },
 
   // === ETH Mainnet oracle addresses ===
   // WBTC/USDC, WBTC/USDT, WBTC/EURC, WBTC/WETH — BTC price driven
