@@ -63,12 +63,8 @@ apps/client/src/e2e-real.ts
 apps/client/src/deploy-arb.ts
 apps/client/src/phase1-replay.ts
 apps/client/src/mempoolWatcher.ts
-apps/client/src/morpho-event-watcher.ts
 apps/client/src/test-cbxrp-boundary.ts
 apps/client/src/test-cbxrp-trace*.ts
-apps/client/src/utils/direct-position-reader.ts
-apps/client/src/utils/harness-filter-bypass.ts
-apps/client/src/utils/shadow-runtime.ts
 
 # Root-level ad-hoc scripts
 check_balances.ts
