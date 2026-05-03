@@ -63,6 +63,14 @@ export const KNOWN_POOLS: Record<number, [Address, Address, Address][]> = {
       "0xa8E4C55D6dAf4D768aeBa2378c1AD94c112Ef48a" as Address,
     ],
   ],
+  [arbitrum.id]: [
+    // K/USDC — fee 10000 (only active pool; fee=3000 pool has 0 liquidity)
+    [
+      "0x010700AB046Dd8e92b0e3587842080Df36364ed3" as Address,
+      "0xaf88d065e77c8cC2239327C5EDb3A432268e5831" as Address,
+      "0x8Ff3E7506b92F020a256cdF023cd8931519E78Af" as Address,
+    ],
+  ],
 };
 
 export const CBXRP_POOL_AWARE_CONFIG: Partial<Record<number, CbXrpPoolAwareConfig>> = {
