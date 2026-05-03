@@ -3,8 +3,8 @@
  *
  * Drop-in eth_sendRawTransaction to bloXroute's private BDN for Base (chain 8453).
  * Configured via env:
- *   - BLOXROUTE_BASE_AUTH   (required)  — auth header value from bloXroute dashboard
- *   - BLOXROUTE_BASE_URL    (optional)  — overrides default endpoint; must be *.blxrbdn.com
+ *   - BLXR_AUTH_HEADER or BLOXROUTE_BASE_AUTH (required) — auth header value from bloXroute dashboard
+ *   - BLXR_BASE_RPC or BLOXROUTE_BASE_URL     (optional) — overrides default endpoint; must be *.blxrbdn.com
  *
  * Safety:
  *   - Accepts ONLY pre-signed raw transaction hex (0x-prefixed). No signing here.
@@ -12,7 +12,9 @@
  *   - Fails fast via AbortSignal (default 5s). Never blocks the hot path.
  */
 
-const DEFAULT_BLOXROUTE_BASE_URL = "https://eth-protect.rpc.blxrbdn.com";
+// Base default. Aligns with parallel-submitter.ts. The mainnet ETH endpoint
+// `eth-protect.rpc.blxrbdn.com` rejects chainId=8453 transactions silently.
+const DEFAULT_BLOXROUTE_BASE_URL = "https://api.blxrbdn.com";
 const DEFAULT_BLOXROUTE_TIMEOUT_MS = 5_000;
 
 export interface BloxrouteConfig {
@@ -50,10 +52,10 @@ function parseTimeoutMs(value: string | undefined): number {
 function normalizeAuthHeader(rawAuth: string): string {
   const trimmed = rawAuth.trim();
   if (trimmed.length === 0) {
-    throw new Error("BLOXROUTE_BASE_AUTH missing");
+    throw new Error("bloXroute auth header missing");
   }
   if (/\s/.test(trimmed)) {
-    throw new Error("BLOXROUTE_BASE_AUTH contains whitespace");
+    throw new Error("bloXroute auth header contains whitespace");
   }
   return trimmed;
 }
@@ -62,10 +64,12 @@ export function loadBloxrouteConfig(opts?: {
   envOverride?: NodeJS.ProcessEnv;
 }): BloxrouteConfig | null {
   const env = opts?.envOverride ?? process.env;
-  const rawAuth = env.BLOXROUTE_BASE_AUTH;
+  const rawAuth = env.BLXR_AUTH_HEADER ?? env.BLOXROUTE_BASE_AUTH;
   if (!rawAuth) return null;
 
-  const url = validateBloxrouteUrl(env.BLOXROUTE_BASE_URL ?? DEFAULT_BLOXROUTE_BASE_URL);
+  const url = validateBloxrouteUrl(
+    env.BLXR_BASE_RPC ?? env.BLOXROUTE_BASE_URL ?? DEFAULT_BLOXROUTE_BASE_URL,
+  );
   const authHeader = normalizeAuthHeader(rawAuth);
   const timeoutMs = parseTimeoutMs(env.BLOXROUTE_TIMEOUT_MS);
 

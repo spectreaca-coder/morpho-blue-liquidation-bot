@@ -16,7 +16,9 @@ import { type Address, type Hex } from "viem";
 
 // WebSocket constructor type (resolved at runtime via dynamic import)
 type WSConstructor = new (url: string) => {
-  on: (event: string, cb: (...args: unknown[]) => void) => void;
+  on(event: "message", cb: (data: Buffer) => void): void;
+  on(event: "error", cb: (err: unknown) => void): void;
+  on(event: string, cb: (...args: unknown[]) => void): void;
   send: (data: string) => void;
   close: () => void;
 };
@@ -180,7 +182,7 @@ export class CexPredictor {
         product_ids: COINBASE_PAIRS,
         channels: ["ticker"],
       });
-      this.ws.send(subscribeMsg);
+      this.ws?.send(subscribeMsg);
     });
 
     this.ws.on("message", (data: Buffer) => {
@@ -214,8 +216,10 @@ export class CexPredictor {
       this.scheduleReconnect();
     });
 
-    this.ws.on("error", (err: Error) => {
-      console.error(`${this.logTag}CEX Predictor: WS error: ${err.message}`);
+    this.ws.on("error", (err: unknown) => {
+      console.error(
+        `${this.logTag}CEX Predictor: WS error: ${err instanceof Error ? err.message : String(err)}`,
+      );
       this.ws?.close();
     });
   }

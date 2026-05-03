@@ -43,7 +43,7 @@ export interface CanaryConfig {
   statePath: string;
 }
 
-export type CanaryEventType = "attempt" | "pass" | "revert" | "skipped";
+export type CanaryEventType = "attempt" | "pass" | "revert" | "dropped" | "skipped";
 
 /**
  * Morpho Blue liquidation incentive factor.
@@ -61,7 +61,7 @@ export function estimateLiquidationBonusFactor(lltvWad: bigint): number {
   return Math.min(MAX_LIF, lif);
 }
 
-function estimateLiquidationProfitUsd(expectedBorrowUsd: number, lltvWad: bigint): number {
+export function estimateLiquidationProfitUsd(expectedBorrowUsd: number, lltvWad: bigint): number {
   return expectedBorrowUsd * (estimateLiquidationBonusFactor(lltvWad) - 1);
 }
 
@@ -103,7 +103,7 @@ export interface CanaryEventRecord {
   latencyMs?: number;
   /** Why we skipped (if type === skipped). */
   skipReason?: string;
-  /** Error message (if type === revert). */
+  /** Error message (if type === revert/dropped). */
   errorMessage?: string;
 }
 
@@ -253,7 +253,7 @@ export class CanaryTracker {
     }
 
     // "attempt" is logged-only (optimistic broadcast). Final counters wait for
-    // receipt verification which fires a "pass" or "revert" record.
+    // receipt verification which fires a "pass", "revert", or "dropped" record.
     if (normalizedRecord.type === "attempt") {
       return;
     }

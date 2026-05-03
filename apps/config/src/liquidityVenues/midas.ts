@@ -1,10 +1,10 @@
 import { Address } from "viem";
 import { base, mainnet } from "viem/chains";
 
-export type MidasConfig = {
+export interface MidasConfig {
   instantRedemptionVault: Address;
   redemptionAssets: Address[];
-};
+}
 
 export const midasConfigs: Record<number, Record<Address, MidasConfig>> = {
   [mainnet.id]: {

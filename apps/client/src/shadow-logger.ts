@@ -129,6 +129,12 @@ export class ShadowLogger {
 
   private stopped = false;
   private activeEnrichments = 0;
+  // Serialize appendFile calls so events land in logical call order.
+  // Without this, two concurrent appendFile invocations race through libuv's
+  // thread pool and the later-enqueued write can land first under load (e.g.
+  // parallel vitest workers), producing a shadow_outcome line before its
+  // originating shadow_attempt.
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(params: ShadowLoggerParams) {
     this.logPath = params.logPath;
@@ -396,11 +402,17 @@ export class ShadowLogger {
   private writeEvent(
     event: ShadowAttemptEvent | ShadowOutcomeEvent | ShadowEnrichErrorEvent,
   ): void {
-    void this.ready
-      .then(() => appendFile(this.logPath, `${JSON.stringify(event)}\n`))
+    const serialized = `${JSON.stringify(event)}\n`;
+    // Chain onto the previous write so lines land in the order writeEvent was
+    // invoked. A failed write is isolated (.catch returns void) so one bad
+    // append does not break the chain for subsequent events.
+    this.writeChain = this.writeChain
+      .then(() => this.ready)
+      .then(() => appendFile(this.logPath, serialized))
       .catch((error: unknown) => {
         const message = getErrorMessage(error);
         console.error(`${this.logTag} append failed: ${message}`);
       });
+    void this.writeChain;
   }
 }

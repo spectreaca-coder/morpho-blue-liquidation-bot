@@ -8,6 +8,10 @@ vendor/
 # Cache
 .cache/
 .ponder
+analysis_output/competitor_analysis/cache/
+analysis_output/**/cache/
+/tmp/codex_*
+**/*.receipts.json
 
 # Env
 .env
@@ -21,7 +25,59 @@ yarn-error.log*
 
 # OS
 .DS_Store
+*\ 2.ts
+*\ 2.md
+*\ 2.js
+*\ 2.mjs
 
 # Tools
 .claude/settings.local.json
 .dockerignore
+
+# Dev / analysis scripts (not bot runtime)
+scripts/time-trial/
+scripts/forensic/
+scripts/pm-hunter/
+scripts/harness/
+scripts/ocr-replay/
+scripts/tip-analysis/
+scripts/shadow-benchmark.ts
+scripts/check_recent_liq.ts
+scripts/filter_missed.ts
+scripts/baseLiquidationProfitability.mjs
+tmp/
+logs/
+oci_backups/
+.harness/
+analysis_output/
+
+# Anvil / e2e / debug scripts (one-off, not bot runtime)
+apps/client/anvil-*.ts
+apps/client/e2e-*.ts
+apps/client/close-position.ts
+apps/client/self-liquidation-test.ts
+apps/client/setup-multi-wallet.ts
+apps/client/test-*.ts
+apps/client/src/test-*.ts
+apps/client/src/e2e-real.ts
+apps/client/src/deploy-arb.ts
+apps/client/src/phase1-replay.ts
+apps/client/src/mempoolWatcher.ts
+apps/client/src/morpho-event-watcher.ts
+apps/client/src/test-cbxrp-boundary.ts
+apps/client/src/test-cbxrp-trace*.ts
+apps/client/src/utils/direct-position-reader.ts
+apps/client/src/utils/harness-filter-bypass.ts
+apps/client/src/utils/shadow-runtime.ts
+
+# Root-level ad-hoc scripts
+check_balances.ts
+liq_scan.ts
+e2e-flash-loan-test.ts
+deploy.sh
+healthcheck.sh
+logrotate.sh
+contracts_MockOracle_sol_MockOracle.abi
+contracts_MockOracle_sol_MockOracle.bin
+BOT_CONTEXT.md
+contracts/

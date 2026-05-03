@@ -1,8 +1,24 @@
 import type { FastifyInstance } from "fastify";
 import Fastify from "fastify";
 
+interface HealthState extends Record<string, unknown> {
+  flashblockConnected: boolean;
+  flashblockLastEventMs: number;
+  cexPredictorConnected: boolean;
+  positionCacheLastUpdateMs: number;
+  positionCacheCount: number;
+  txCacheBuiltCount: number;
+  txCacheTotalAtRisk: number;
+  walletBalanceWei: bigint;
+  uptimeMs: number;
+  lastLiquidationAttemptMs: number;
+  errors429Count: number;
+}
+
 /** Global health state — updated by subsystems. */
-export const healthState: Record<string, any> = ((globalThis as any).__healthState ??= {
+export const healthState: HealthState = ((
+  globalThis as { __healthState?: HealthState }
+).__healthState ??= {
   flashblockConnected: false,
   // Initialize to Date.now() so lastEventSec stays bounded even if setter
   // happens to not fire (observed after Session 35 canary wire-up — still
@@ -28,7 +44,7 @@ class HealthServer {
   private port: number;
   private host: string;
 
-  constructor(port = 3000, host = "0.0.0.0") {
+  constructor(port = 3000, host = "127.0.0.1") {
     this.port = port;
     this.host = host;
     this.fastify = Fastify({ logger: false });
@@ -90,7 +106,7 @@ export function getHealthServer(port?: number, host?: string): HealthServer {
   if (!healthServerInstance) {
     const serverPort =
       port ?? Number.parseInt(process.env.PORT ?? process.env.HEALTH_SERVER_PORT ?? "3000", 10);
-    const serverHost = host ?? process.env.HEALTH_SERVER_HOST ?? "0.0.0.0";
+    const serverHost = host ?? process.env.HEALTH_SERVER_HOST ?? "127.0.0.1";
     healthServerInstance = new HealthServer(serverPort, serverHost);
   }
   return healthServerInstance;

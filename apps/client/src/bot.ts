@@ -1,6 +1,10 @@
 import { chainConfigs } from "@morpho-blue-liquidation-bot/config";
 import type { DataProvider } from "@morpho-blue-liquidation-bot/data-providers";
-import type { LiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
+import {
+  estimateUniswapV3MaxSwapIn,
+  type UniswapV3PoolSnapshot,
+  LiquidityVenue,
+} from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
 import {
   AccrualPosition,
@@ -37,8 +41,9 @@ import {
   writeContract,
 } from "viem/actions";
 
-import { type CanaryTracker } from "./canary.js";
+import { estimateLiquidationProfitUsd, type CanaryTracker } from "./canary.js";
 import { discord } from "./discord-notifier.js";
+import { maxSafeSeize } from "./poolCap.js";
 import type { CachedPosition } from "./position-cache.js";
 import {
   type PrimaryWalletCoordinator,
@@ -51,10 +56,12 @@ import {
 } from "./utils/cooldownMechanisms.js";
 import { fetchWhitelistedVaults } from "./utils/fetch-whitelisted-vaults.js";
 import { Flashbots } from "./utils/flashbots.js";
+import { isHarnessBypassActive, getProfitGateUsd } from "./utils/harness-filter-bypass.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
 import { resolveShareLiquidationPlan } from "./utils/morphoLiquidation.js";
 import { MultiBuilderSubmitter } from "./utils/multiBuilder.js";
+import { isShadowMode, submitOrShadow } from "./utils/txSubmitter.js";
 
 const CBXRP_FAST_PATH_SEIZE_BPS = 500n;
 const BPS = 10_000n;
@@ -146,8 +153,11 @@ export class LiquidationBot {
     this.primaryWalletCoordinator = inputs.primaryWalletCoordinator;
     this.shadowLogger = inputs.shadowLogger;
     this.canary = inputs.canary;
-    if (inputs.flashbotAccount) {
-      this.multiBuilder = new MultiBuilderSubmitter(inputs.flashbotAccount);
+    if (inputs.flashbotAccount && inputs.chainId === 1) {
+      this.multiBuilder = new MultiBuilderSubmitter(inputs.flashbotAccount, inputs.chainId);
+    }
+    if (isHarnessBypassActive(this.chainId)) {
+      console.log(`${this.logTag}[HARNESS] filter bypass ACTIVE on Base (env=1)`);
     }
   }
 
@@ -231,7 +241,7 @@ export class LiquidationBot {
     // Compute safe repaidShares using Morpho math to avoid underflow.
     // Morpho's liquidate(seizedAssets) can underflow when computed repaidShares > borrower's shares.
     // Instead, use the repaidShares path: compute shares from target seized amount.
-    const decreasedSeizable = this.capFastPathSeizableCollateral(
+    const decreasedSeizable = await this.capFastPathSeizableCollateral(
       pos,
       this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
     );
@@ -361,9 +371,10 @@ export class LiquidationBot {
         //   $100–$1K:    0.01 gwei
         //   $1K–$10K:    0.02 gwei
         //   $10K+:       0.05 gwei (10x floor, still 40x cheaper than old 2 gwei)
-        if (usd < 1) {
+        const estimatedProfitUsd = estimateLiquidationProfitUsd(usd, pos.lltv);
+        if (estimatedProfitUsd < getProfitGateUsd(this.chainId, 1)) {
           console.log(
-            `${this.logTag}Fast skip: profit gate (usd=${usd.toFixed(2)}) ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol}`,
+            `${this.logTag}Fast skip: profit gate (profit=${estimatedProfitUsd.toFixed(2)} borrowUsd=${usd.toFixed(2)}) ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol}`,
           );
           return false;
         }
@@ -389,7 +400,7 @@ export class LiquidationBot {
               loanSymbol: pos.loanSymbol ?? "",
               expectedBorrowUsd: usd,
               lltvWad: pos.lltv,
-              estimatedProfitUsd: 0,
+              estimatedProfitUsd,
               gasCostUsd: 0,
               actualProfitUsd: 0,
               skipReason: decision.reason,
@@ -421,12 +432,32 @@ export class LiquidationBot {
         let txHash: Hex;
         const signStartMs = Date.now();
         try {
-          txHash = await writeContract(this.client, {
-            address: encoder.address,
-            ...functionData,
-            maxPriorityFeePerGas: dynamicTip,
-            maxFeePerGas: dynamicMaxFee,
-            nonce,
+          txHash = await submitOrShadow({
+            path: "write-contract",
+            triggerPath: "fastLiquidate",
+            candidateRef: {
+              borrower: pos.borrower,
+              marketId: pos.marketId,
+              collateralSymbol: pos.collateralSymbol ?? "",
+            },
+            gasParams: {
+              nonce,
+              maxFeePerGas: dynamicMaxFee,
+              maxPriorityFeePerGas: dynamicTip,
+            },
+            writeArgs: {
+              address: encoder.address,
+              functionName: functionData.functionName,
+            },
+            submit: () =>
+              writeContract(this.client, {
+                address: encoder.address,
+                ...functionData,
+                maxPriorityFeePerGas: dynamicTip,
+                maxFeePerGas: dynamicMaxFee,
+                nonce,
+              }),
+            createSyntheticResult: (syntheticTxHash) => syntheticTxHash,
           });
         } catch (error) {
           this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
@@ -454,9 +485,12 @@ export class LiquidationBot {
           throw error;
         }
         const broadcastedMs = Date.now();
+        const shadowMode = isShadowMode();
 
         console.log(
-          `${this.logTag}⚡ OPTIMISTIC SENT ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol} tx=${txHash}`,
+          shadowMode
+            ? `${this.logTag}⚡ SHADOW INTENT ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol} syntheticTx=${txHash} (not broadcast)`
+            : `${this.logTag}⚡ OPTIMISTIC SENT ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol} tx=${txHash}`,
         );
         this.shadowLogger?.recordAttempt({
           borrower: pos.borrower,
@@ -468,11 +502,17 @@ export class LiquidationBot {
           ourMaxFeePerGasWei: dynamicMaxFee,
           ourSentBlock: 0n,
           ourSentMs: broadcastedMs,
-          expectedProfitUsd: usd,
+          expectedProfitUsd: estimatedProfitUsd,
         });
         this.markPositionUsed(marketId, pos.borrower);
         discord
-          .notifyTxFired(`${pos.collateralSymbol}/${pos.loanSymbol}`, pos.borrower, txHash, 0)
+          .notifyTxFired(
+            `${pos.collateralSymbol}/${pos.loanSymbol}`,
+            pos.borrower,
+            txHash,
+            0,
+            shadowMode,
+          )
           .catch(() => {});
 
         // Canary: log broadcast as "attempt" (no counter update). Final P&L is
@@ -488,7 +528,7 @@ export class LiquidationBot {
             loanSymbol: pos.loanSymbol ?? "",
             expectedBorrowUsd: usd,
             lltvWad: pos.lltv,
-            estimatedProfitUsd: 0,
+            estimatedProfitUsd,
             gasCostUsd: 0,
             actualProfitUsd: 0,
             txHash,
@@ -498,20 +538,23 @@ export class LiquidationBot {
             latencyMs: broadcastedMs - signStartMs,
           });
 
-          // Fire-and-forget receipt verification.
-          this.verifyCanaryReceipt(txHash, {
-            borrower: pos.borrower,
-            marketId: pos.marketId,
-            collateralSymbol: pos.collateralSymbol,
-            loanSymbol: pos.loanSymbol ?? "",
-            expectedBorrowUsd: usd,
-            lltvWad: pos.lltv,
-            priorityFeeGwei: Number(dynamicTip) / 1e9,
-          }).catch((e: unknown) => {
-            console.log(
-              `${this.logTag}Canary receipt verify failed: ${e instanceof Error ? e.message : String(e)}`,
-            );
-          });
+          // Fire-and-forget receipt verification. Shadow-only mode produces a
+          // synthetic tx hash, so there is intentionally no receipt to verify.
+          if (!shadowMode) {
+            this.verifyCanaryReceipt(txHash, {
+              borrower: pos.borrower,
+              marketId: pos.marketId,
+              collateralSymbol: pos.collateralSymbol,
+              loanSymbol: pos.loanSymbol ?? "",
+              expectedBorrowUsd: usd,
+              lltvWad: pos.lltv,
+              priorityFeeGwei: Number(dynamicTip) / 1e9,
+            }).catch((e: unknown) => {
+              console.log(
+                `${this.logTag}Canary receipt verify failed: ${e instanceof Error ? e.message : String(e)}`,
+              );
+            });
+          }
         }
         return true;
       } else if (this.flashbotAccount) {
@@ -534,12 +577,39 @@ export class LiquidationBot {
       } else {
         // Simple path — just send
         const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        // Explicit gas-fee caps. viem's default `baseFee + 2.5 gwei` causes
+        // "total cost exceeds balance" on low-balance wallets (well-known per
+        // BOT_CONTEXT.md). Same caps as auto-refuel.ts.
+        const SIMPLE_PATH_MAX_FEE_PER_GAS = 100_000_000n; // 0.1 gwei
+        const SIMPLE_PATH_MAX_PRIORITY_FEE_PER_GAS = 10_000_000n; // 0.01 gwei
         let txHash: Hex;
         try {
-          txHash = await writeContract(this.client, {
-            address: encoder.address,
-            ...functionData,
-            nonce,
+          txHash = await submitOrShadow({
+            path: "write-contract",
+            triggerPath: "fastLiquidate-simple",
+            candidateRef: {
+              borrower: pos.borrower,
+              marketId: pos.marketId,
+              collateralSymbol: pos.collateralSymbol ?? "",
+            },
+            gasParams: {
+              nonce,
+              maxFeePerGas: SIMPLE_PATH_MAX_FEE_PER_GAS,
+              maxPriorityFeePerGas: SIMPLE_PATH_MAX_PRIORITY_FEE_PER_GAS,
+            },
+            writeArgs: {
+              address: encoder.address,
+              functionName: functionData.functionName,
+            },
+            submit: () =>
+              writeContract(this.client, {
+                address: encoder.address,
+                ...functionData,
+                nonce,
+                maxFeePerGas: SIMPLE_PATH_MAX_FEE_PER_GAS,
+                maxPriorityFeePerGas: SIMPLE_PATH_MAX_PRIORITY_FEE_PER_GAS,
+              }),
+            createSyntheticResult: (syntheticTxHash) => syntheticTxHash,
           });
         } catch (error) {
           this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
@@ -622,38 +692,85 @@ export class LiquidationBot {
       lltv: BigInt(marketParams.lltv),
     };
 
-    // Step 1: Build collateral→loan conversion calls
-    if (
-      !(await this.convertCollateralToLoan(
-        marketParams,
-        this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
-        encoder,
-      ))
-    )
+    // Sprint 42a: use repaidShares path (NOT seizedAssets). The seizedAssets
+    // path is deprecated because Morpho rounds shares vs assets differently
+    // on the two paths and a naive seizedAssets call caused 25 reverts in
+    // Session 39 forensics. Mirror fastLiquidate's flow:
+    //   1) call resolveShareLiquidationPlan to compute the largest repaid-
+    //      shares amount whose seized collateral fits within the target.
+    //   2) build the collateral→loan conversion using the predicted seized.
+    //   3) encode `morphoBlueLiquidate(... 0n /*seized*/, plan.repaidShares)`.
+    const decreasedSeizable = this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition);
+
+    // Read oracle price for share calculation.
+    let oraclePrice: bigint;
+    try {
+      oraclePrice = await readContract(this.client, {
+        address: marketParams.oracle,
+        abi: [
+          {
+            name: "price",
+            type: "function",
+            stateMutability: "view",
+            inputs: [],
+            outputs: [{ type: "uint256" }],
+          },
+        ] as const,
+        functionName: "price",
+      });
+    } catch (err: unknown) {
+      console.warn(
+        `${this.logTag}liquidate: cannot read oracle price for ${MarketUtils.getMarketId(marketParams)}: ${err instanceof Error ? err.message : String(err)}`,
+      );
       return;
+    }
+
+    const liquidationPlan = resolveShareLiquidationPlan({
+      borrowShares: position.borrowShares,
+      collateral: position.collateral,
+      totalBorrowAssets: position.market.totalBorrowAssets,
+      totalBorrowShares: position.market.totalBorrowShares,
+      price: oraclePrice,
+      lltv: BigInt(marketParams.lltv),
+      targetSeizedAssets: decreasedSeizable,
+    });
+
+    if (liquidationPlan === null) {
+      console.warn(
+        `${this.logTag}liquidate: no safe repaidShares plan for ${position.user} ${MarketUtils.getMarketId(marketParams)}`,
+      );
+      return;
+    }
+
+    // Step 1: Build collateral→loan conversion calls using predicted seized amount.
+    if (
+      !(await this.convertCollateralToLoan(marketParams, liquidationPlan.seizedAssets, encoder))
+    ) {
+      return;
+    }
     const collateralToLoanCalls = encoder.flush();
 
-    // Step 2: Flash loan repay amount = borrower's debt in LOAN TOKEN units
-    // position.borrowAssets is the borrower's debt denominated in loan token
-    // Add 1% buffer for interest accrual between query and execution
-    const repayAmount = (position.borrowAssets * 101n) / 100n;
+    // Step 2: Flash loan repay amount based on predicted repaidAssets (not full
+    // borrowAssets). Add 1% buffer for interest accrual between query and execution.
+    const repayAmount = (liquidationPlan.repaidAssets * 101n) / 100n;
 
-    // Step 3: Build flash loan liquidation
-    // Inner: approve + liquidate (with collateral→loan callback)
+    // Step 3: Build flash loan liquidation using repaidShares (avoids underflow).
+    // Inner: approve + liquidate (with collateral→loan callback).
     encoder.erc20Approve(marketParams.loanToken, morpho, 0n);
     encoder.erc20Approve(marketParams.loanToken, morpho, maxUint256);
     encoder.morphoBlueLiquidate(
       morpho,
       market,
       position.user,
-      this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
       0n,
+      liquidationPlan.repaidShares,
       collateralToLoanCalls,
     );
 
     // Self-funding tip for WETH loan markets (25% of estimated profit)
     const isWethLoan = marketParams.loanToken.toLowerCase() === this.wNative.toLowerCase();
     const useSelfFundingTip = this.flashbotAccount !== undefined && !badDebtPosition && isWethLoan;
+    let selfFundingTipAmount: bigint | undefined;
     if (useSelfFundingTip) {
       // Estimate profit: liquidation incentive ≈ 1/LLTV - 1 ≈ 15% for 86% LLTV
       // Tip = 25% of estimated profit = repayAmount * ~15% * 25% ≈ repayAmount * 3.75%
@@ -666,6 +783,7 @@ export class LiquidationBot {
         dynamicTip < MIN_TIP ? MIN_TIP : dynamicTip > MAX_TIP ? MAX_TIP : dynamicTip;
       encoder.unwrapETH(this.wNative, tipAmount);
       encoder.tip(tipAmount);
+      selfFundingTipAmount = tipAmount;
     }
 
     // Flush all callback calls for the flash loan
@@ -714,6 +832,8 @@ export class LiquidationBot {
         position.user,
         badDebtPosition,
         useSelfFundingTip,
+        undefined,
+        selfFundingTipAmount,
       );
 
       if (success)
@@ -788,7 +908,27 @@ export class LiquidationBot {
     badDebtPosition: boolean,
     selfFundingTip = false,
     existingLease?: PrimaryWalletLease,
+    /**
+     * H2 fix: when `selfFundingTip` is true, the tip is encoded inside the bundle
+     * (unwrapETH + tip ops). The bot-wallet `balanceOf(loanToken)` measured by
+     * simulateCalls does NOT see this outflow because the executor contract holds
+     * the tipped ETH temporarily and the unwrap reduces executor's WETH (not
+     * wallet's). Pass the encoded tip amount in WEI so checkProfit can subtract
+     * it from gross profit and reject negative-net liquidations.
+     */
+    selfFundingTipWei?: bigint,
   ) {
+    // H7: defensive guard. The selfFundingTip path encodes the tip inside the
+    // bundle (unwrapETH + tip ops), so checkProfit MUST subtract it explicitly.
+    // If a caller sets selfFundingTip=true but forgets to pass the WEI amount,
+    // we'd silently regress the H2 fix and accept negative-net liquidations.
+    if (selfFundingTip && (selfFundingTipWei === undefined || selfFundingTipWei <= 0n)) {
+      throw new Error(
+        `handleTx: selfFundingTip=true requires selfFundingTipWei > 0n; got ${String(selfFundingTipWei)}. ` +
+          `This would regress the H2 profit-accounting fix.`,
+      );
+    }
+
     const functionData = {
       abi: executorAbi,
       functionName: "exec_606BaXt",
@@ -834,6 +974,10 @@ export class LiquidationBot {
           price: gasPrice,
         },
         badDebtPosition,
+        // H2: pass the self-funding tip amount so checkProfit can subtract it.
+        // Tip is encoded inside the bundle but the operator's loanToken balance
+        // delta does not capture it (executor holds the tip path).
+        selfFundingTip ? selfFundingTipWei : undefined,
       ))
     )
       return false;
@@ -998,12 +1142,32 @@ export class LiquidationBot {
         const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
         let txHash: Hex;
         try {
-          txHash = await writeContract(this.client, {
-            address: encoder.address,
-            ...functionData,
-            maxPriorityFeePerGas: effectivePriorityFee,
-            maxFeePerGas,
-            nonce,
+          txHash = await submitOrShadow({
+            path: "write-contract",
+            triggerPath: "handleTx-l2bid",
+            candidateRef: {
+              borrower,
+              marketId,
+              collateralSymbol: "",
+            },
+            gasParams: {
+              nonce,
+              maxFeePerGas,
+              maxPriorityFeePerGas: effectivePriorityFee,
+            },
+            writeArgs: {
+              address: encoder.address,
+              functionName: functionData.functionName,
+            },
+            submit: () =>
+              writeContract(this.client, {
+                address: encoder.address,
+                ...functionData,
+                maxPriorityFeePerGas: effectivePriorityFee,
+                maxFeePerGas,
+                nonce,
+              }),
+            createSyntheticResult: (syntheticTxHash) => syntheticTxHash,
           });
         } catch (error) {
           this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
@@ -1030,12 +1194,39 @@ export class LiquidationBot {
         return true;
       } else {
         const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+        // Explicit gas-fee caps. viem's default `baseFee + 2.5 gwei` causes
+        // "total cost exceeds balance" on low-balance wallets. Same caps as
+        // auto-refuel.ts and fastLiquidate simple path.
+        const SIMPLE_PATH_MAX_FEE_PER_GAS = 100_000_000n; // 0.1 gwei
+        const SIMPLE_PATH_MAX_PRIORITY_FEE_PER_GAS = 10_000_000n; // 0.01 gwei
         let txHash: Hex;
         try {
-          txHash = await writeContract(this.client, {
-            address: encoder.address,
-            ...functionData,
-            nonce,
+          txHash = await submitOrShadow({
+            path: "write-contract",
+            triggerPath: "handleTx-simple",
+            candidateRef: {
+              borrower,
+              marketId,
+              collateralSymbol: "",
+            },
+            gasParams: {
+              nonce,
+              maxFeePerGas: SIMPLE_PATH_MAX_FEE_PER_GAS,
+              maxPriorityFeePerGas: SIMPLE_PATH_MAX_PRIORITY_FEE_PER_GAS,
+            },
+            writeArgs: {
+              address: encoder.address,
+              functionName: functionData.functionName,
+            },
+            submit: () =>
+              writeContract(this.client, {
+                address: encoder.address,
+                ...functionData,
+                nonce,
+                maxFeePerGas: SIMPLE_PATH_MAX_FEE_PER_GAS,
+                maxPriorityFeePerGas: SIMPLE_PATH_MAX_PRIORITY_FEE_PER_GAS,
+              }),
+            createSyntheticResult: (syntheticTxHash) => syntheticTxHash,
           });
         } catch (error) {
           this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
@@ -1170,6 +1361,12 @@ export class LiquidationBot {
       price: bigint;
     },
     badDebtPosition: boolean,
+    /**
+     * H2 fix: tip amount in WEI when the tip is encoded inside the bundle
+     * (self-funding-tip path). Subtracted from gross profit so we reject
+     * sub-tip-floor liquidations whose net is negative.
+     */
+    selfFundingTipWei?: bigint,
   ) {
     if (this.pricers === undefined || this.pricers.length === 0) return true;
 
@@ -1182,14 +1379,17 @@ export class LiquidationBot {
       const profit = loanAssetBalance.afterTx - loanAssetBalance.beforeTx;
       if (profit <= 0n) return false; // zero recovery — don't burn gas
 
-      const [profitUsd, gasCostUsd] = await Promise.all([
+      const [profitUsd, gasCostUsd, tipUsd] = await Promise.all([
         this.price(loanAsset, profit, this.pricers),
         this.price(this.wNative, gas.used * gas.price, this.pricers),
+        selfFundingTipWei !== undefined && selfFundingTipWei > 0n
+          ? this.price(this.wNative, selfFundingTipWei, this.pricers)
+          : Promise.resolve(0),
       ]);
 
-      // Only realize bad debt if profit exceeds gas cost
-      if (profitUsd !== undefined && gasCostUsd !== undefined) {
-        return profitUsd > gasCostUsd;
+      // Only realize bad debt if profit exceeds gas + tip cost
+      if (profitUsd !== undefined && gasCostUsd !== undefined && tipUsd !== undefined) {
+        return profitUsd > gasCostUsd + tipUsd;
       }
       // If we can't price, skip to be safe (don't waste gas on unknown)
       return false;
@@ -1202,14 +1402,18 @@ export class LiquidationBot {
 
     if (loanAssetProfit <= 0n) return false;
 
-    const [loanAssetProfitUsd, gasUsedUsd] = await Promise.all([
+    const [loanAssetProfitUsd, gasUsedUsd, tipUsd] = await Promise.all([
       this.price(loanAsset, loanAssetProfit, this.pricers),
       this.price(this.wNative, gas.used * gas.price, this.pricers),
+      selfFundingTipWei !== undefined && selfFundingTipWei > 0n
+        ? this.price(this.wNative, selfFundingTipWei, this.pricers)
+        : Promise.resolve(0),
     ]);
 
-    if (loanAssetProfitUsd === undefined || gasUsedUsd === undefined) return false;
+    if (loanAssetProfitUsd === undefined || gasUsedUsd === undefined || tipUsd === undefined)
+      return false;
 
-    const profitUsd = loanAssetProfitUsd - gasUsedUsd;
+    const profitUsd = loanAssetProfitUsd - gasUsedUsd - tipUsd;
 
     return profitUsd > 0;
   }
@@ -1223,10 +1427,51 @@ export class LiquidationBot {
     return wMulDown(seizableCollateral, WAD - parseUnits(liquidationBufferBps.toString(), 14));
   }
 
-  private capFastPathSeizableCollateral(pos: CachedPosition, seizableCollateral: bigint) {
+  private async capFastPathSeizableCollateral(
+    pos: CachedPosition,
+    seizableCollateral: bigint,
+  ): Promise<bigint> {
     if (pos.collateralSymbol !== "cbXRP") return seizableCollateral;
 
-    return (seizableCollateral * CBXRP_FAST_PATH_SEIZE_BPS) / BPS;
+    const cbXrpPoolAware = chainConfigs[this.chainId]?.options.cbXrpPoolAware;
+    if (
+      cbXrpPoolAware === undefined ||
+      cbXrpPoolAware.marketId.toLowerCase() !== pos.marketId.toLowerCase()
+    ) {
+      // Not the pool-aware market or config absent — use static 5% cap as safe fallback.
+      return (seizableCollateral * CBXRP_FAST_PATH_SEIZE_BPS) / BPS;
+    }
+
+    try {
+      const snapshotCache = new Map<string, UniswapV3PoolSnapshot>();
+      const directDepth = await estimateUniswapV3MaxSwapIn({
+        client: this.client,
+        pool: cbXrpPoolAware.direct.pool,
+        tokenIn: pos.collateralToken,
+        slippageBudgetBps: cbXrpPoolAware.slippageBudgetBps,
+        snapshotCache,
+      });
+      const fallbackDepth = await estimateUniswapV3MaxSwapIn({
+        client: this.client,
+        pool: cbXrpPoolAware.fallback.cbXrpToWeth.pool,
+        tokenIn: pos.collateralToken,
+        slippageBudgetBps: cbXrpPoolAware.slippageBudgetBps,
+        snapshotCache,
+      });
+      const poolCap = maxSafeSeize({
+        directPoolMaxIn: directDepth.maxSwapIn,
+        fallbackLeg1MaxIn: fallbackDepth.maxSwapIn,
+        requestedSeize: seizableCollateral,
+        config: cbXrpPoolAware,
+      });
+      // If both pools are fully depth-exhausted, fall back to static 5% cap — never skip the cap.
+      return poolCap > 0n ? poolCap : (seizableCollateral * CBXRP_FAST_PATH_SEIZE_BPS) / BPS;
+    } catch {
+      console.warn(
+        `${this.logTag}Fast liquidate: pool depth estimate error for cbXRP — using static 5% cap`,
+      );
+      return (seizableCollateral * CBXRP_FAST_PATH_SEIZE_BPS) / BPS;
+    }
   }
 
   private checkCooldown(marketId: Hex, account: Address) {
@@ -1253,7 +1498,28 @@ export class LiquidationBot {
       vaultWhitelist,
     );
 
-    this.coveredMarkets = [...whitelistedMarketsFromVaults, ...this.additionalMarketsWhitelist];
+    const mergedMarkets = [
+      ...new Set([...whitelistedMarketsFromVaults, ...this.additionalMarketsWhitelist]),
+    ];
+    if (this.chainId === 8453 && this.additionalMarketsWhitelist.length > 0) {
+      const allowedMarketIds = new Set(
+        this.additionalMarketsWhitelist.map((marketId) => marketId.toLowerCase()),
+      );
+      const filteredMarkets = mergedMarkets.filter((marketId) =>
+        allowedMarketIds.has(marketId.toLowerCase()),
+      );
+      const droppedMarkets = mergedMarkets.filter(
+        (marketId) => !allowedMarketIds.has(marketId.toLowerCase()),
+      );
+      if (droppedMarkets.length > 0) {
+        console.log(
+          `${this.logTag}Base allowlist: filtered ${droppedMarkets.length} non-primary markets from vault queues`,
+        );
+      }
+      this.coveredMarkets = filteredMarkets;
+    } else {
+      this.coveredMarkets = mergedMarkets;
+    }
     this.marketsFetchingCooldownMechanism.markFetchingDone();
   }
 
@@ -1300,7 +1566,7 @@ export class LiquidationBot {
       this.canary.recordResult({
         timestamp: nowMs,
         eventDate,
-        type: "revert",
+        type: "dropped",
         borrower: ctx.borrower,
         marketId: ctx.marketId,
         collateralSymbol: ctx.collateralSymbol,
@@ -1312,7 +1578,7 @@ export class LiquidationBot {
         actualProfitUsd: 0,
         txHash,
         priorityFeeGwei: ctx.priorityFeeGwei,
-        errorMessage: "receipt_timeout_30s",
+        errorMessage: "receipt_timeout_30s_no_receipt",
       });
       return;
     }

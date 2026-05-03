@@ -2,7 +2,14 @@ import dotenv from "dotenv";
 import type { Address, Chain, Hex } from "viem";
 
 import { chainConfigs } from "./config";
-import type { ChainConfig, DataProviderName, LiquidityVenueName, PricerName } from "./types";
+import type {
+  ChainConfig,
+  CbXrpPoolAwareConfig,
+  DataProviderName,
+  LiquidityVenueName,
+  PendingPrewarmFeedMap,
+  PricerName,
+} from "./types";
 
 dotenv.config();
 
@@ -40,7 +47,7 @@ export function getSecrets(chainId: number, chain?: Chain) {
 
   const rpcUrl = process.env[`RPC_URL_${chainId}`] ?? defaultRpcUrl;
   const fallbackRpcUrlRaw = process.env[`RPC_URL_FALLBACK_${chainId}`];
-  const fallbackRpcUrl = fallbackRpcUrlRaw || undefined; // Treat empty string as unset
+  const fallbackRpcUrl = sanitizeFallbackRpcUrl(chainId, fallbackRpcUrlRaw);
   const wsUrl = process.env[`WS_URL_${chainId}`]; // Optional WebSocket URL
   const executorAddress = process.env[`EXECUTOR_ADDRESS_${chainId}`];
   const liquidationPrivateKey = process.env[`LIQUIDATION_PRIVATE_KEY_${chainId}`];
@@ -63,12 +70,33 @@ export function getSecrets(chainId: number, chain?: Chain) {
   };
 }
 
+function sanitizeFallbackRpcUrl(chainId: number, rawUrl: string | undefined): string | undefined {
+  if (!rawUrl) return undefined;
+  try {
+    const url = new URL(rawUrl);
+    const isUnauthenticatedAnkrBase =
+      chainId === 8453 && url.hostname === "rpc.ankr.com" && url.pathname === "/base";
+    if (isUnauthenticatedAnkrBase) {
+      console.warn(
+        `Ignoring RPC_URL_FALLBACK_${chainId}: unauthenticated Ankr Base endpoint returns 401`,
+      );
+      return undefined;
+    }
+  } catch {
+    console.warn(`Ignoring RPC_URL_FALLBACK_${chainId}: invalid URL`);
+    return undefined;
+  }
+  return rawUrl;
+}
+
 export * from "./chains";
 export {
   chainConfigs,
   type ChainConfig,
+  type CbXrpPoolAwareConfig,
   type DataProviderName,
   type LiquidityVenueName,
+  type PendingPrewarmFeedMap,
   type PricerName,
 };
 export * from "./dataProviders";

@@ -3,9 +3,9 @@ import type { Address, Hex } from "viem";
 import { encodePacked, maxUint256, parseUnits } from "viem";
 
 import type { LiquidationEncoder } from "./LiquidationEncoder.js";
+import { MORPHO_BLUE } from "./morphoConstants.js";
 
-/** Morpho Blue core contract (ETH mainnet). */
-export const MORPHO_BLUE: Address = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb";
+export { MORPHO_BLUE };
 
 /** Wrapped ETH (ETH mainnet). */
 export const WETH: Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";

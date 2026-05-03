@@ -39,7 +39,9 @@ describe("bloxrouteSubmit", () => {
     });
 
     expect(config).toEqual({
-      url: "https://eth-protect.rpc.blxrbdn.com/",
+      // H1 fix: Base default is api.blxrbdn.com, not the mainnet ETH endpoint
+      // eth-protect.rpc.blxrbdn.com which silently rejects chainId=8453 txs.
+      url: "https://api.blxrbdn.com/",
       authHeader: "dashboard-token",
       timeoutMs: 5_000,
     });

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { startHealthServer } from "../../src/health.js";
+import { healthState, startHealthServer } from "../../src/health.js";
 
 describe("Health endpoint", () => {
   let healthServer: Awaited<ReturnType<typeof startHealthServer>>;
@@ -9,6 +9,8 @@ describe("Health endpoint", () => {
   beforeAll(async () => {
     // Use a random port for testing to avoid conflicts
     port = 3001;
+    healthState.flashblockConnected = true;
+    healthState.flashblockLastEventMs = Date.now();
     healthServer = await startHealthServer(port, "127.0.0.1");
   });
 
@@ -23,6 +25,7 @@ describe("Health endpoint", () => {
     expect(response.headers.get("content-type")).toContain("application/json");
 
     const data = await response.json();
-    expect(data).toEqual({ status: "ok" });
+    expect(data.status).toBe("ok");
+    expect(data.flashblock).toMatchObject({ connected: true, stale: false });
   });
 });

@@ -14,10 +14,27 @@ import {
 } from "viem";
 import { estimateGas, getBlockNumber, getTransactionCount } from "viem/actions";
 
+import { submitBundleOrShadow, type ShadowSubmitMetadata } from "./txSubmitter.js";
+
 export namespace Flashbots {
   let nextId = 0;
 
   export const FLASHBOTS_RELAY = "https://relay.flashbots.net";
+
+  interface FlashbotsRpcResponse {
+    result?: {
+      bundleHash?: string;
+      sealedByBuildersAt?: unknown;
+      isHighPriority?: boolean;
+      simulatedAt?: string;
+    };
+    error?: { message?: string } | string;
+  }
+
+  function flashbotsErrorMessage(error: FlashbotsRpcResponse["error"], fallback: string): string {
+    if (typeof error === "string") return error;
+    return error?.message ?? fallback;
+  }
 
   /**
    * Signs a Flashbots bundle with this provider's `authSigner` key.
@@ -84,37 +101,55 @@ export namespace Flashbots {
     txs: Hex[],
     targetBlockNumber: bigint,
     account: LocalAccount,
+    shadowContext?: ShadowSubmitMetadata,
   ): Promise<{ bundleHash: string }> {
-    const body = JSON.stringify({
-      method: "eth_sendBundle",
-      params: [
-        {
-          txs,
-          blockNumber: `0x${targetBlockNumber.toString(16)}`,
-        },
-      ],
-      id: nextId++,
-      jsonrpc: "2.0",
-    });
-
-    const response = await fetch(FLASHBOTS_RELAY, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Flashbots-Signature": `${account.address}:${await account.signMessage({
-          message: keccak256(stringToBytes(body)),
-        })}`,
+    return submitBundleOrShadow<{ bundleHash: string }>({
+      path: "flashbots-bundle",
+      ...shadowContext,
+      bundle: {
+        txCount: txs.length,
+        targetBlockNumber: targetBlockNumber.toString(),
+        blockCount: shadowContext?.bundle?.blockCount ?? 1,
       },
-      body,
+      metadata: {
+        relay: "flashbots",
+        ...(shadowContext?.metadata ?? {}),
+      },
+      extractOutcome: (result) => ({ txHash: result.bundleHash }),
+      submit: async () => {
+        const body = JSON.stringify({
+          method: "eth_sendBundle",
+          params: [
+            {
+              txs,
+              blockNumber: `0x${targetBlockNumber.toString(16)}`,
+            },
+          ],
+          id: nextId++,
+          jsonrpc: "2.0",
+        });
+
+        const response = await fetch(FLASHBOTS_RELAY, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Flashbots-Signature": `${account.address}:${await account.signMessage({
+              message: keccak256(stringToBytes(body)),
+            })}`,
+          },
+          body,
+        });
+
+        const responseBody = (await response.json()) as FlashbotsRpcResponse;
+
+        if (!response.ok || responseBody.error) {
+          throw Error(flashbotsErrorMessage(responseBody.error, "eth_sendBundle failed"));
+        }
+
+        return { bundleHash: responseBody.result?.bundleHash ?? "unknown" };
+      },
+      createSyntheticResult: (syntheticTxHash) => ({ bundleHash: syntheticTxHash }),
     });
-
-    const responseBody = (await response.json()) as any;
-
-    if (!response.ok || responseBody.error) {
-      throw Error(responseBody.error?.message ?? responseBody.error ?? "eth_sendBundle failed");
-    }
-
-    return { bundleHash: responseBody.result?.bundleHash ?? "unknown" };
   }
 
   /**
@@ -143,7 +178,7 @@ export namespace Flashbots {
       body,
     });
 
-    const responseBody = (await response.json()) as any;
+    const responseBody = (await response.json()) as FlashbotsRpcResponse;
     if (!response.ok || responseBody.error) {
       return { isIncluded: false, isHighPriority: false };
     }

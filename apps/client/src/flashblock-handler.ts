@@ -14,7 +14,7 @@
  * Extracted from index.ts for readability. Business logic is preserved exactly.
  */
 
-import { type ChainConfig } from "@morpho-blue-liquidation-bot/config";
+import type { ChainConfig, PendingPrewarmFeedMap } from "@morpho-blue-liquidation-bot/config";
 import { type Hex, encodeFunctionData } from "viem";
 import { getGasPrice, getTransactionReceipt, readContract, sendRawTransaction } from "viem/actions";
 
@@ -32,11 +32,16 @@ import {
   RATE_FEED_AGGREGATORS,
   SKIP_SYMBOLS,
 } from "./liquidation-constants";
+import { POLL_GAS_LIMIT, getPollGasParams } from "./poll-liquidation-trigger.js";
 import { type PositionCache, calculateHF } from "./position-cache";
+import type { PreSigner, PreSignedTx } from "./preSigner.js";
 import { type PrimaryWalletCoordinator } from "./primary-wallet-coordinator";
 import { type ShadowLogger } from "./shadow-logger";
 import { TxCache, type PrebuiltTx } from "./tx-cache";
 import { buildBloxroutePromise, loadBloxrouteConfig } from "./utils/bloxrouteSubmit.js";
+import { getMinBorrowUsdc6Dec } from "./utils/harness-filter-bypass.js";
+import { createEventTimer, type EventTimer } from "./utils/shadowTimingLogger.js";
+import { isShadowMode, submitOrShadow } from "./utils/txSubmitter.js";
 
 /**
  * H1: Dynamic priority fee tiers based on estimated USD borrow size.
@@ -61,11 +66,21 @@ const PRIORITY_FEE_FLOOR = 5_000_000n; // 0.005 gwei — match competitor median
 const PRIORITY_FEE_SMALL = 10_000_000n; // 0.01 gwei
 const PRIORITY_FEE_MID = 20_000_000n; // 0.02 gwei
 const PRIORITY_FEE_WHALE = 50_000_000n; // 0.05 gwei (still 40x cheaper than old)
+/** Gas limit for batched Flashblock liquidation txs. Kept as a single source so
+ *  PreSigner cache-hit validation doesn't hardcode the literal twice. */
+const FLASHBLOCK_GAS_LIMIT = POLL_GAS_LIMIT;
+
+/** Max age of a PreSigned tx before we consider it stale and re-sign. */
+const PRESIGN_MAX_AGE_MS = 30_000;
+const PENDING_PREWARM_TTL_MS = 5_000;
 /** Minimum USD borrow value to attempt liquidation. Below this, spray bot territory. */
 const MIN_PROFIT_GATE_USD = 10;
 
-/** Rough ETH price used only to bucket WETH-denominated borrows into USD tiers. */
-const WETH_USD_HEURISTIC = 2200;
+/** Rough ETH price used only to bucket WETH-denominated borrows into USD tiers.
+ *  Kept in sync with bot.ts ETH_USD_FALLBACK / auto-refuel.ts ETH_PRICE_USD_CONSERVATIVE.
+ *  Stale values cause the priority-fee tier to misclassify ~$10K WETH borrows as MID
+ *  instead of WHALE, losing same-block ordering on competitive positions. */
+const WETH_USD_HEURISTIC = 3500;
 
 /** WAD = 10^18, Morpho's fixed-point base for HF comparison. */
 const WAD = 10n ** 18n;
@@ -113,6 +128,14 @@ export function estimateBorrowUsd(prebuilt: PrebuiltTx): number {
   return 0;
 }
 
+function toTimingCandidateRef(borrower: `0x${string}`, marketId: Hex, collateralSymbol: string) {
+  return {
+    borrower,
+    marketId,
+    collateralSymbol,
+  };
+}
+
 export { MIN_PROFIT_GATE_USD };
 
 export class FlashblockHandler {
@@ -123,9 +146,12 @@ export class FlashblockHandler {
   private readonly txCache: TxCache;
   private readonly primaryWalletCoordinator: PrimaryWalletCoordinator;
   private readonly shadowLogger?: ShadowLogger;
+  private readonly preSigner?: PreSigner;
+  private readonly pendingPrewarmFeeds?: PendingPrewarmFeedMap;
 
   /** Per-aggregator debounce: only attempt once per block per aggregator. */
   private readonly lastBlockByAggregator = new Map<string, number>();
+  private readonly pendingSeenTxs = new Map<string, number>();
 
   /** Track last extracted Chainlink price per aggregator address.
    *  Used to detect price direction: drops tighten filter, rises relax filter. */
@@ -160,6 +186,27 @@ export class FlashblockHandler {
 
   private readonly canary?: CanaryTracker;
 
+  // ---------------------------------------------------------------------------
+  // PreSign aggregate telemetry counters (rolling window, reset after each emit)
+  // ---------------------------------------------------------------------------
+  private presignHit = 0;
+  private miss_stale = 0;
+  private miss_nonce = 0;
+  private miss_calldata = 0;
+  private miss_gas = 0;
+  private miss_fee = 0;
+  private miss_tip = 0;
+  private cold_no_cache = 0;
+  private batchCount = 0;
+  /** Accumulated cold-sign latency samples (ms). */
+  private coldSignLatencyMs: number[] = [];
+  /** Accumulated presign-hit read latency samples (ms). */
+  private presignHitLatencyMs: number[] = [];
+  private metricsEmitInterval: ReturnType<typeof setInterval> | null = null;
+
+  /** Interval (ms) between aggregate [PreSignMetrics] emits. */
+  private static readonly METRICS_EMIT_INTERVAL_MS = 60_000;
+
   constructor(
     logTag: string,
     config: ChainConfig,
@@ -169,6 +216,8 @@ export class FlashblockHandler {
     primaryWalletCoordinator: PrimaryWalletCoordinator,
     canary?: CanaryTracker,
     shadowLogger?: ShadowLogger,
+    preSigner?: PreSigner,
+    pendingPrewarmFeeds?: PendingPrewarmFeedMap,
   ) {
     this.logTag = logTag;
     this.config = config;
@@ -178,11 +227,15 @@ export class FlashblockHandler {
     this.primaryWalletCoordinator = primaryWalletCoordinator;
     this.canary = canary;
     this.shadowLogger = shadowLogger;
+    this.preSigner = preSigner;
+    this.pendingPrewarmFeeds = pendingPrewarmFeeds;
 
     if (this.bloxrouteConfig) {
       console.log(`${this.logTag}bloXroute Protect enabled → ${this.bloxrouteConfig.url}`);
     } else {
-      console.log(`${this.logTag}bloXroute Protect disabled (BLOXROUTE_BASE_AUTH unset)`);
+      console.log(
+        `${this.logTag}bloXroute Protect disabled (BLXR_AUTH_HEADER/BLOXROUTE_BASE_AUTH unset)`,
+      );
     }
 
     // Pre-cache gas price every 15s — eliminates 30ms RPC on hot path
@@ -201,6 +254,69 @@ export class FlashblockHandler {
     this.gasPriceRefreshInterval = setInterval(() => {
       void refreshGasPrice();
     }, 15_000);
+
+    // Periodic aggregate PreSign telemetry emit (rolling window).
+    this.metricsEmitInterval = setInterval(() => {
+      this._emitPreSignMetrics();
+    }, FlashblockHandler.METRICS_EMIT_INTERVAL_MS);
+  }
+
+  /** Emit aggregate PreSign telemetry and reset counters for the next window. */
+  private _emitPreSignMetrics(): void {
+    const missCount =
+      this.miss_stale +
+      this.miss_nonce +
+      this.miss_calldata +
+      this.miss_gas +
+      this.miss_fee +
+      this.miss_tip +
+      this.cold_no_cache;
+    const coldAvg =
+      this.coldSignLatencyMs.length > 0
+        ? this.coldSignLatencyMs.reduce((a, b) => a + b, 0) / this.coldSignLatencyMs.length
+        : 0;
+    const hitAvg =
+      this.presignHitLatencyMs.length > 0
+        ? this.presignHitLatencyMs.reduce((a, b) => a + b, 0) / this.presignHitLatencyMs.length
+        : 0;
+    console.log(
+      `${this.logTag}[PreSignMetrics] hit=${this.presignHit} miss_stale=${this.miss_stale} ` +
+        `miss_nonce=${this.miss_nonce} miss_calldata=${this.miss_calldata} miss_gas=${this.miss_gas} ` +
+        `miss_fee=${this.miss_fee} miss_tip=${this.miss_tip} cold_no_cache=${this.cold_no_cache} ` +
+        `missCount=${missCount} coldSignAvgMs=${coldAvg.toFixed(2)} hitReadAvgMs=${hitAvg.toFixed(2)} ` +
+        `batches=${this.batchCount}`,
+    );
+    // Reset rolling window
+    this.presignHit = 0;
+    this.miss_stale = 0;
+    this.miss_nonce = 0;
+    this.miss_calldata = 0;
+    this.miss_gas = 0;
+    this.miss_fee = 0;
+    this.miss_tip = 0;
+    this.cold_no_cache = 0;
+    this.batchCount = 0;
+    this.coldSignLatencyMs = [];
+    this.presignHitLatencyMs = [];
+  }
+
+  dispose(): void {
+    if (this.gasPriceRefreshInterval !== null) {
+      clearInterval(this.gasPriceRefreshInterval);
+      this.gasPriceRefreshInterval = null;
+    }
+    if (this.metricsEmitInterval !== null) {
+      clearInterval(this.metricsEmitInterval);
+      this.metricsEmitInterval = null;
+    }
+  }
+
+  /**
+   * Expose full cleanup for external shutdown. Calls dispose() internally.
+   * No change to construction or wiring — expose only for future use.
+   */
+  destroy(): void {
+    this.dispose();
   }
 
   /**
@@ -208,6 +324,17 @@ export class FlashblockHandler {
    * All business logic preserved exactly from the original index.ts callback.
    */
   handleOracleUpdate(event: OracleUpdateEvent): void {
+    if (event.source === "alchemy-pending") {
+      this.handlePendingOracleUpdate(event);
+      return;
+    }
+
+    const eventTimer: EventTimer = createEventTimer("flashblock", {
+      oracleAddress: event.aggregatorAddress,
+      oracleBlockNumber: event.blockNumber,
+    });
+    eventTimer.setHandlerDispatch();
+
     const now = Date.now();
     this.lastFlashblockEventMs = now;
     setFlashblockLastEventMs(now);
@@ -367,7 +494,8 @@ export class FlashblockHandler {
     nearLiquidation = nearLiquidation.filter((c) => {
       if (SKIP_SYMBOLS.has(c.position.collateralSymbol.toLowerCase())) return false;
       const loanDec = c.position.loanDecimals;
-      const minBorrow = loanDec <= 8 ? MIN_BORROW_USDC_6DEC : MIN_BORROW_WETH_18DEC;
+      const defaultMinBorrow = loanDec <= 8 ? MIN_BORROW_USDC_6DEC : MIN_BORROW_WETH_18DEC;
+      const minBorrow = getMinBorrowUsdc6Dec(this.config.chainId, defaultMinBorrow);
       return c.borrowAssets >= minBorrow;
     });
 
@@ -375,9 +503,18 @@ export class FlashblockHandler {
       // BATCH FIRE: collect all candidates, sign all TXs with sequential nonces, send simultaneously.
       // Previous approach: acquire wallet per candidate → pool full after 1st → rest fallback to slow path.
       // New approach: acquire wallet ONCE, sign N TXs with nonce, nonce+1, ..., send ALL at once.
-      const candidates = nearLiquidation.slice(0, 10).filter((c) => {
-        const key = `${c.position.borrower.toLowerCase()}:${c.position.marketId}`;
-        if (this.inFlightBorrowers.has(key)) return false;
+      const candidates = nearLiquidation.slice(0, 10).filter((candidate) => {
+        const ref = toTimingCandidateRef(
+          candidate.position.borrower,
+          candidate.position.marketId,
+          candidate.position.collateralSymbol,
+        );
+        const key = `${candidate.position.borrower.toLowerCase()}:${candidate.position.marketId}`;
+        if (this.inFlightBorrowers.has(key)) {
+          eventTimer.addCandidate(ref);
+          eventTimer.setSkipped(ref, "in-flight");
+          return false;
+        }
         const MAX_IN_FLIGHT = 100;
         const EVICT_TARGET = 50;
         if (this.inFlightBorrowers.size > MAX_IN_FLIGHT) {
@@ -385,13 +522,24 @@ export class FlashblockHandler {
             0,
             this.inFlightBorrowers.size - EVICT_TARGET,
           );
-          for (const k of toEvict) this.inFlightBorrowers.delete(k);
+          for (const staleKey of toEvict) this.inFlightBorrowers.delete(staleKey);
         }
         this.inFlightBorrowers.add(key);
         return true;
       });
 
       if (candidates.length === 0) return;
+
+      // Sprint 51b: register all candidates in the timer for fan-out rows.
+      for (const c of candidates) {
+        eventTimer.addCandidate(
+          toTimingCandidateRef(
+            c.position.borrower,
+            c.position.marketId,
+            c.position.collateralSymbol,
+          ),
+        );
+      }
 
       // Split into cache-hit and cache-miss
       type Candidate = (typeof candidates)[0];
@@ -413,343 +561,105 @@ export class FlashblockHandler {
           `batch ${cacheHits.length} cached + ${cacheMisses.length} fresh [${filterDecision}]`,
       );
 
-      // BATCH PATH: sign all cache-hit TXs with sequential nonces, send simultaneously
       if (cacheHits.length > 0) {
-        // TxCache pre-built TXs use config.executorAddress (wallet[0]).
-        // Must fire with wallet[0] to match the encoded executor address in callbacks.
         const lease = this.primaryWalletCoordinator.tryAcquire(
           `flashblock-batch:${event.blockNumber}:${symbolPatterns.join(",") || "unknown"}`,
         );
-        if (lease !== null) {
-          this.isBatchInFlight = true;
-          const sequencerUrl =
-            this.config.chainId === 8453 ? "https://mainnet-sequencer.base.org" : undefined;
-          // Snapshot of all cache hits before any filtering — used for inFlightBorrowers cleanup.
-          const allCacheHitsSnapshot = [...cacheHits];
-
-          (async () => {
-            // Gas price is pre-cached (refreshed every 15s) — zero RPC on hot path.
-            const baseMaxFeePerGas = this.cachedMaxFeePerGas;
-            const floorPriorityFee = this.cachedMaxPriorityFeePerGas;
-
-            // P0: On-chain HF verification for rate feed candidates.
-            // Rate feeds bypass the precision HF path (findLiquidatableByPrice) and use
-            // stale API HF only. Before spending gas, verify HF < 1.0 using the Morpho
-            // oracle's live price(). Adds ~50-100ms per unique oracle but prevents false
-            // positive fires like the wrsETH/WETH revert at block 44608565 (HF=1.005).
-            if (isRateFeed) {
-              const oraclePrices = new Map<string, bigint>();
-              for (const { candidate: c } of cacheHits) {
-                const oracleAddr = c.position.oracle.toLowerCase();
-                if (!oraclePrices.has(oracleAddr)) {
-                  try {
-                    const price = await readContract(this.primaryWalletCoordinator.client, {
-                      address: c.position.oracle,
-                      abi: ORACLE_PRICE_ABI,
-                      functionName: "price",
-                    });
-                    oraclePrices.set(oracleAddr, price);
-                  } catch {
-                    // Oracle read failed — allow candidate through (fail-open)
-                  }
-                }
-              }
-
-              const allCacheHits = [...cacheHits]; // preserve for cleanup
-              cacheHits = cacheHits.filter(({ candidate: c }) => {
-                const oraclePrice = oraclePrices.get(c.position.oracle.toLowerCase());
-                if (!oraclePrice) return true; // fail-open
-                const hf = calculateHF(
-                  c.position.collateral,
-                  c.position.borrowShares,
-                  c.position.totalBorrowAssets,
-                  c.position.totalBorrowShares,
-                  oraclePrice,
-                  c.position.lltv,
-                );
-                if (hf >= WAD) {
-                  console.log(
-                    `${this.logTag}⚡ RATE FEED HF GATE: ${c.position.borrower.slice(0, 10)}... ` +
-                      `${c.position.collateralSymbol}/${c.position.loanSymbol} ` +
-                      `HF=${(Number(hf) / 1e18).toFixed(6)} ≥ 1.0 — BLOCKED (false positive)`,
-                  );
-                  return false;
-                }
-                return true;
-              });
-
-              if (cacheHits.length === 0 && allCacheHits.length > 0) {
-                console.log(
-                  `${this.logTag}⚡ RATE FEED HF GATE: all ${allCacheHits.length} candidates healthy — aborting batch`,
-                );
-                this.primaryWalletCoordinator.release(lease);
-                this.isBatchInFlight = false;
-                for (const { candidate: c } of allCacheHits) {
-                  this.inFlightBorrowers.delete(
-                    `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
-                  );
-                }
-                return;
-              }
-            }
-
-            // Step 1: Sign ALL TXs locally with sequential nonces (0ms per sign, 1 RPC for initial nonce)
-            const signedTxs: {
-              signed: Hex;
-              prebuilt: PrebuiltEntry["prebuilt"];
-              nonce: number;
-              maxFeePerGas: bigint;
-              maxPriorityFeePerGas: bigint;
-              borrowerKey: string;
-            }[] = [];
-
-            for (const { candidate: c, prebuilt } of cacheHits) {
-              // Canary gate (Phase 2): applied per-TX in batch path.
-              if (this.canary) {
-                const usd = estimateBorrowUsd(prebuilt);
-                const decision = this.canary.shouldAttempt({
-                  collateralSymbol: prebuilt.collateralSymbol,
-                  expectedBorrowUsd: usd,
-                  lltvWad: prebuilt.lltv,
-                });
-                if (!decision.allow) {
-                  console.log(
-                    `${this.logTag}Canary skip (batch): ${decision.reason} ${prebuilt.borrower} ${prebuilt.collateralSymbol}/${prebuilt.loanSymbol}`,
-                  );
-                  this.canary.recordResult({
-                    timestamp: Date.now(),
-                    eventDate: new Date().toISOString().slice(0, 10),
-                    type: "skipped",
-                    borrower: prebuilt.borrower,
-                    marketId: prebuilt.marketId,
-                    collateralSymbol: prebuilt.collateralSymbol,
-                    loanSymbol: prebuilt.loanSymbol ?? "",
-                    expectedBorrowUsd: usd,
-                    lltvWad: prebuilt.lltv,
-                    estimatedProfitUsd: 0,
-                    gasCostUsd: 0,
-                    actualProfitUsd: 0,
-                    skipReason: decision.reason,
-                  });
-                  continue;
-                }
-              }
-              const calldata = encodeFunctionData({
-                abi: TxCache.functionData.abi,
-                functionName: TxCache.functionData.functionName,
-                args: [prebuilt.calls],
-              });
-              // H1: per-TX dynamic priority fee based on estimated borrow USD.
-              // Never below the chain floor (0.01 gwei on Base) so dust still beats 0-tip bots.
-              const dynamicTip = estimatePriorityFeeWei(prebuilt);
-              const maxPriorityFeePerGas =
-                dynamicTip > floorPriorityFee ? dynamicTip : floorPriorityFee;
-              // EIP-1559 requires maxFeePerGas >= baseFee + priorityFee.
-              // Sprint D1 found cachedMaxFeePerGas (15s-stale gasPrice × 2) can lag
-              // behind real-time baseFee spikes causing rejects. Hard floor at 2 gwei
-              // ensures coverage up to ~1.95 gwei baseFee (covers >99% of Base scenarios).
-              const MAX_FEE_FLOOR = 2_000_000_000n; // 2 gwei
-              const dynamicCap =
-                baseMaxFeePerGas > maxPriorityFeePerGas
-                  ? baseMaxFeePerGas
-                  : baseMaxFeePerGas + maxPriorityFeePerGas;
-              const maxFeePerGas = dynamicCap > MAX_FEE_FLOOR ? dynamicCap : MAX_FEE_FLOOR;
-              const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
-              let signed: Hex;
-              try {
-                signed = await this.primaryWalletCoordinator.client.signTransaction({
-                  to: this.primaryWalletCoordinator.executorAddress,
-                  data: calldata,
-                  gas: 700_000n,
-                  maxFeePerGas,
-                  maxPriorityFeePerGas,
-                  nonce,
-                  type: "eip1559" as const,
-                });
-              } catch (error) {
-                this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
-                throw error;
-              }
-              signedTxs.push({
-                signed,
-                prebuilt,
-                nonce,
-                maxFeePerGas,
-                maxPriorityFeePerGas,
-                borrowerKey: c.position.borrower.toLowerCase(),
-              });
-            }
-
-            console.log(
-              `${this.logTag}⚡ BATCH SIGNED: ${signedTxs.length} TXs (nonces ${signedTxs[0]?.nonce}-${signedTxs[signedTxs.length - 1]?.nonce})`,
-            );
-
-            // Step 2: Send ALL simultaneously via dual path
-            const sendResults = await Promise.allSettled(
-              signedTxs.map(
-                async ({ signed, prebuilt, nonce, maxFeePerGas, maxPriorityFeePerGas }) => {
-                  const promises: Promise<string>[] = [
-                    sendRawTransaction(this.primaryWalletCoordinator.client, {
-                      serializedTransaction: signed,
-                    }),
-                  ];
-                  if (sequencerUrl) {
-                    promises.push(
-                      fetch(sequencerUrl, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                          jsonrpc: "2.0",
-                          method: "eth_sendRawTransaction",
-                          params: [signed],
-                          id: 1,
-                        }),
-                        signal: AbortSignal.timeout(5_000),
-                      })
-                        .then((r) => r.json())
-                        .then((r: unknown) => {
-                          const res = r as { result?: string };
-                          if (!res.result?.startsWith("0x")) throw new Error("empty");
-                          return res.result;
-                        })
-                        .catch(() => {
-                          throw new Error("seq failed");
-                        }),
-                    );
-                  }
-                  if (this.bloxrouteConfig) {
-                    promises.push(buildBloxroutePromise(this.bloxrouteConfig, signed));
-                  }
-                  const txHash = await Promise.any(promises);
-                  const broadcastedMs = Date.now();
-                  console.log(
-                    `${this.logTag}⚡ BATCH TX SENT: ${prebuilt.borrower.slice(0, 10)}... ${prebuilt.collateralSymbol}/${prebuilt.loanSymbol} tx=${txHash} (nonce=${nonce})`,
-                  );
-
-                  // Canary: log broadcast as "attempt", then fire-and-forget receipt verify.
-                  const usd = estimateBorrowUsd(prebuilt);
-                  if (this.canary) {
-                    const flashblockReceivedMs = Date.parse(event.detectedAt);
-                    const latencyMs = Number.isFinite(flashblockReceivedMs)
-                      ? broadcastedMs - flashblockReceivedMs
-                      : undefined;
-                    this.canary.recordResult({
-                      timestamp: broadcastedMs,
-                      eventDate: new Date(broadcastedMs).toISOString().slice(0, 10),
-                      type: "attempt",
-                      borrower: prebuilt.borrower,
-                      marketId: prebuilt.marketId,
-                      collateralSymbol: prebuilt.collateralSymbol,
-                      loanSymbol: prebuilt.loanSymbol ?? "",
-                      expectedBorrowUsd: usd,
-                      lltvWad: prebuilt.lltv,
-                      estimatedProfitUsd: 0,
-                      gasCostUsd: 0,
-                      actualProfitUsd: 0,
-                      txHash: txHash as Hex,
-                      priorityFeeGwei: Number(estimatePriorityFeeWei(prebuilt)) / 1e9,
-                      broadcastedMs,
-                      flashblockReceivedMs: Number.isFinite(flashblockReceivedMs)
-                        ? flashblockReceivedMs
-                        : undefined,
-                      latencyMs,
-                    });
-                    // Receipt watcher — fires after ~30s and records final outcome.
-                    this.verifyBatchReceipt(txHash as Hex, prebuilt, usd).catch(() => {});
-                  }
-                  this.shadowLogger?.recordAttempt({
-                    borrower: prebuilt.borrower,
-                    marketId: prebuilt.marketId,
-                    collateralSymbol: prebuilt.collateralSymbol,
-                    loanSymbol: prebuilt.loanSymbol ?? "",
-                    ourTxHash: txHash as Hex,
-                    ourTipWei: maxPriorityFeePerGas,
-                    ourMaxFeePerGasWei: maxFeePerGas,
-                    ourSentBlock: BigInt(event.blockNumber),
-                    ourSentMs: broadcastedMs,
-                    expectedProfitUsd: usd,
-                    flashblockReceivedMs: Number.isFinite(Date.parse(event.detectedAt))
-                      ? Date.parse(event.detectedAt)
-                      : undefined,
-                  });
-                  return txHash;
-                },
-              ),
-            );
-
-            // Step 3: Check results
-            let sent = 0,
-              failed = 0;
-            for (const r of sendResults) {
-              if (r.status === "fulfilled") sent++;
-              else failed++;
-            }
-            console.log(`${this.logTag}⚡ BATCH RESULT: ${sent} sent, ${failed} failed`);
-            discord
-              .notifyBatchResult(sent, failed, symbolPatterns.join(",") || "unknown")
-              .catch((e: unknown) => {
-                console.error("[notify]", e instanceof Error ? e.message : e);
-              });
-
-            if (failed > 0) {
-              this.primaryWalletCoordinator.resetNonceCache(lease);
-            }
-          })()
-            .catch((e: unknown) => {
-              console.error(
-                `${this.logTag}Batch error:`,
-                e instanceof Error ? e.message : String(e),
-              );
-              this.primaryWalletCoordinator.resetNonceCache(lease);
-            })
-            .finally(() => {
-              this.isBatchInFlight = false;
-              this.primaryWalletCoordinator.release(lease);
-              // Use snapshot to clean up ALL candidates including those filtered by HF gate
-              for (const { candidate: c } of allCacheHitsSnapshot) {
-                this.inFlightBorrowers.delete(
-                  `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
-                );
-              }
-            });
-        } else {
+        if (lease === null) {
           console.log(`${this.logTag}FLASHBLOCK: primary wallet busy — skipping cached batch`);
           for (const { candidate: c } of cacheHits) {
+            eventTimer.setSkipped(
+              toTimingCandidateRef(
+                c.position.borrower,
+                c.position.marketId,
+                c.position.collateralSymbol,
+              ),
+              "busy-wallet",
+            );
             this.inFlightBorrowers.delete(
               `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
             );
           }
+          for (const c of cacheMisses) {
+            eventTimer.setSkipped(
+              toTimingCandidateRef(
+                c.position.borrower,
+                c.position.marketId,
+                c.position.collateralSymbol,
+              ),
+              "busy-wallet",
+            );
+            this.inFlightBorrowers.delete(
+              `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+            );
+          }
+          eventTimer.flush();
+          return;
         }
-      }
 
-      // FRESH PATH: cache misses go through fastLiquidate ONLY if no batch is running.
-      // If batch acquired the wallet, fastLiquidate would use the same wallet → nonce collision.
-      // With single wallet, skip cache misses during batch fire to prevent races.
-      if (cacheHits.length === 0) {
-        (async () => {
-          // P0 (fresh path): HF gate for rate-feed cache misses — mirrors the cache-hit gate above.
-          // Rate-feed positions use stale API HF; verify with live oracle price() before fastLiquidate.
-          let activeMisses = cacheMisses;
-          if (isRateFeed && cacheMisses.length > 0) {
-            const oraclePricesFresh = new Map<string, bigint>();
-            for (const c of cacheMisses) {
+        this.isBatchInFlight = true;
+        for (const c of cacheMisses) {
+          eventTimer.setSkipped(
+            toTimingCandidateRef(
+              c.position.borrower,
+              c.position.marketId,
+              c.position.collateralSymbol,
+            ),
+            "in-flight",
+          );
+          this.inFlightBorrowers.delete(
+            `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+          );
+        }
+
+        const sequencerUrl =
+          this.config.chainId === 8453 ? "https://mainnet-sequencer.base.org" : undefined;
+        const allCacheHitsSnapshot = [...cacheHits];
+
+        void (async () => {
+          const baseMaxFeePerGas = this.cachedMaxFeePerGas;
+          const floorPriorityFee = this.cachedMaxPriorityFeePerGas;
+
+          if (isRateFeed) {
+            const oraclePrices = new Map<string, bigint>();
+            const oracleReadFailed = new Set<string>();
+            for (const { candidate: c } of cacheHits) {
               const oracleAddr = c.position.oracle.toLowerCase();
-              if (!oraclePricesFresh.has(oracleAddr)) {
+              if (!oraclePrices.has(oracleAddr) && !oracleReadFailed.has(oracleAddr)) {
                 try {
                   const price = await readContract(this.primaryWalletCoordinator.client, {
                     address: c.position.oracle,
                     abi: ORACLE_PRICE_ABI,
                     functionName: "price",
                   });
-                  oraclePricesFresh.set(oracleAddr, price);
-                } catch {
-                  // Oracle read failed — allow candidate through (fail-open)
+                  oraclePrices.set(oracleAddr, price);
+                } catch (err) {
+                  // Fail-closed: cannot verify HF, skip to avoid revert on false positive.
+                  // RATE_FEED candidates have ~high false-positive rate from blue-api lag.
+                  oracleReadFailed.add(oracleAddr);
+                  console.warn(
+                    `${this.logTag}⚡ RATE FEED oracle read failed for ${oracleAddr} — skipping candidates (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+                  );
                 }
               }
             }
-            activeMisses = cacheMisses.filter((c) => {
-              const oraclePrice = oraclePricesFresh.get(c.position.oracle.toLowerCase());
-              if (!oraclePrice) return true; // fail-open
+
+            const allCacheHits = [...cacheHits];
+            cacheHits = cacheHits.filter(({ candidate: c }) => {
+              const oracleAddr = c.position.oracle.toLowerCase();
+              if (oracleReadFailed.has(oracleAddr)) {
+                eventTimer.setSkipped(
+                  toTimingCandidateRef(
+                    c.position.borrower,
+                    c.position.marketId,
+                    c.position.collateralSymbol,
+                  ),
+                  "gate-fail",
+                );
+                return false;
+              }
+              const oraclePrice = oraclePrices.get(oracleAddr);
+              if (!oraclePrice) return true;
               const hf = calculateHF(
                 c.position.collateral,
                 c.position.borrowShares,
@@ -760,60 +670,626 @@ export class FlashblockHandler {
               );
               if (hf >= WAD) {
                 console.log(
-                  `${this.logTag}⚡ RATE FEED HF GATE (fresh): ${c.position.borrower.slice(0, 10)}... ` +
+                  `${this.logTag}⚡ RATE FEED HF GATE: ${c.position.borrower.slice(0, 10)}... ` +
                     `${c.position.collateralSymbol}/${c.position.loanSymbol} ` +
                     `HF=${(Number(hf) / 1e18).toFixed(6)} ≥ 1.0 — BLOCKED (false positive)`,
                 );
-                this.inFlightBorrowers.delete(
-                  `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+                eventTimer.setSkipped(
+                  toTimingCandidateRef(
+                    c.position.borrower,
+                    c.position.marketId,
+                    c.position.collateralSymbol,
+                  ),
+                  "gate-fail",
                 );
                 return false;
               }
               return true;
             });
+
+            if (cacheHits.length === 0 && allCacheHits.length > 0) {
+              console.log(
+                `${this.logTag}⚡ RATE FEED HF GATE: all ${allCacheHits.length} candidates healthy — aborting batch`,
+              );
+              return;
+            }
           }
-          await Promise.allSettled(
-            activeMisses.map((c) =>
-              this.bot
-                .fastLiquidate(c.position, c.seizableCollateral, c.borrowAssets)
-                .catch((e: unknown) => {
-                  console.error(
-                    `${this.logTag}Fast liquidate error:`,
-                    e instanceof Error ? e.message : e,
+
+          const signedTxs: {
+            signed: Hex;
+            prebuilt: PrebuiltEntry["prebuilt"];
+            nonce: number;
+            maxFeePerGas: bigint;
+            maxPriorityFeePerGas: bigint;
+          }[] = [];
+          let hitCount = 0;
+
+          for (const { candidate: c, prebuilt } of cacheHits) {
+            const candidateRef = toTimingCandidateRef(
+              prebuilt.borrower,
+              prebuilt.marketId,
+              prebuilt.collateralSymbol,
+            );
+            if (this.canary) {
+              const usd = estimateBorrowUsd(prebuilt);
+              const decision = this.canary.shouldAttempt({
+                collateralSymbol: prebuilt.collateralSymbol,
+                expectedBorrowUsd: usd,
+                lltvWad: prebuilt.lltv,
+              });
+              if (!decision.allow) {
+                console.log(
+                  `${this.logTag}Canary skip (batch): ${decision.reason} ${prebuilt.borrower} ${prebuilt.collateralSymbol}/${prebuilt.loanSymbol}`,
+                );
+                this.canary.recordResult({
+                  timestamp: Date.now(),
+                  eventDate: new Date().toISOString().slice(0, 10),
+                  type: "skipped",
+                  borrower: prebuilt.borrower,
+                  marketId: prebuilt.marketId,
+                  collateralSymbol: prebuilt.collateralSymbol,
+                  loanSymbol: prebuilt.loanSymbol ?? "",
+                  expectedBorrowUsd: usd,
+                  lltvWad: prebuilt.lltv,
+                  estimatedProfitUsd: 0,
+                  gasCostUsd: 0,
+                  actualProfitUsd: 0,
+                  skipReason: decision.reason,
+                });
+                eventTimer.setSkipped(candidateRef, "gate-fail");
+                continue;
+              }
+            }
+
+            const calldata = encodeFunctionData({
+              abi: TxCache.functionData.abi,
+              functionName: TxCache.functionData.functionName,
+              args: [prebuilt.calls],
+            });
+            eventTimer.setCalldataReady(candidateRef);
+
+            const dynamicTip = estimatePriorityFeeWei(prebuilt);
+            const maxPriorityFeePerGas =
+              dynamicTip > floorPriorityFee ? dynamicTip : floorPriorityFee;
+            // Hot-path floor: 2 gwei. Higher than auto-refuel's 0.1 gwei simple-path
+            // floor by design — liquidations are time-critical and need to clear the
+            // Base sequencer queue ahead of competing bots, while refuel txs can wait.
+            // Do NOT unify these constants without re-running competitor analysis.
+            const MAX_FEE_FLOOR = 2_000_000_000n;
+            const dynamicCap =
+              baseMaxFeePerGas > maxPriorityFeePerGas
+                ? baseMaxFeePerGas
+                : baseMaxFeePerGas + maxPriorityFeePerGas;
+            const maxFeePerGas = dynamicCap > MAX_FEE_FLOOR ? dynamicCap : MAX_FEE_FLOOR;
+            const cached: PreSignedTx | undefined = this.preSigner?.get(
+              c.position.borrower,
+              c.position.marketId,
+            );
+            const cachedAgeMs = cached === undefined ? undefined : Date.now() - cached.createdAt;
+            let nonce: number | undefined;
+
+            let reuseReason:
+              | "hit"
+              | "miss_none"
+              | "miss_nonce"
+              | "miss_fee"
+              | "miss_tip"
+              | "miss_calldata"
+              | "miss_stale"
+              | "miss_gas" = "miss_none";
+            let signed: Hex | undefined;
+
+            if (cached !== undefined) {
+              if ((cachedAgeMs ?? 0) > PRESIGN_MAX_AGE_MS) {
+                reuseReason = "miss_stale";
+                this.miss_stale += 1;
+                this.preSigner?.invalidate(c.position.borrower, c.position.marketId);
+              } else if (cached.calldata !== calldata) {
+                reuseReason = "miss_calldata";
+                this.miss_calldata += 1;
+                this.preSigner?.invalidate(c.position.borrower, c.position.marketId);
+              } else if (cached.gas !== FLASHBLOCK_GAS_LIMIT) {
+                reuseReason = "miss_gas";
+                this.miss_gas += 1;
+                this.preSigner?.invalidate(c.position.borrower, c.position.marketId);
+              } else if (cached.maxFeePerGas < maxFeePerGas) {
+                reuseReason = "miss_fee";
+                this.miss_fee += 1;
+                this.preSigner?.invalidate(c.position.borrower, c.position.marketId);
+              } else if (cached.maxPriorityFeePerGas < maxPriorityFeePerGas) {
+                reuseReason = "miss_tip";
+                this.miss_tip += 1;
+                this.preSigner?.invalidate(c.position.borrower, c.position.marketId);
+              } else {
+                if (this.primaryWalletCoordinator.claimReservedNonce(lease, cached.nonce)) {
+                  nonce = cached.nonce;
+                  reuseReason = "hit";
+                  const hitReadStart = performance.now();
+                  signed = cached.signedTx;
+                  this.presignHitLatencyMs.push(performance.now() - hitReadStart);
+                  this.presignHit += 1;
+                  hitCount += 1;
+                } else {
+                  nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+                  if (cached.nonce === nonce) {
+                    reuseReason = "hit";
+                    const hitReadStart = performance.now();
+                    signed = cached.signedTx;
+                    this.presignHitLatencyMs.push(performance.now() - hitReadStart);
+                    this.presignHit += 1;
+                    hitCount += 1;
+                  } else {
+                    reuseReason = "miss_nonce";
+                    this.miss_nonce += 1;
+                    this.preSigner?.invalidate(c.position.borrower, c.position.marketId);
+                  }
+                }
+              }
+            } else {
+              this.cold_no_cache += 1;
+            }
+
+            console.log(
+              `${this.logTag}[PreSign] ${reuseReason} borrower=${c.position.borrower.slice(0, 10)} ` +
+                `market=${c.position.marketId.slice(0, 10)} nonce=${nonce ?? "-"} ` +
+                `cachedMaxFee=${cached?.maxFeePerGas ?? "-"} reqMaxFee=${maxFeePerGas} ` +
+                `cachedTip=${cached?.maxPriorityFeePerGas ?? "-"} reqTip=${maxPriorityFeePerGas} ` +
+                `age=${cachedAgeMs ?? "-"}ms`,
+            );
+
+            if (signed === undefined) {
+              try {
+                if (nonce === undefined) {
+                  nonce = await this.primaryWalletCoordinator.nextNonce(lease);
+                }
+                const coldSignStart = performance.now();
+                signed = await this.primaryWalletCoordinator.client.signTransaction({
+                  to: this.primaryWalletCoordinator.executorAddress,
+                  data: calldata,
+                  gas: FLASHBLOCK_GAS_LIMIT,
+                  maxFeePerGas,
+                  maxPriorityFeePerGas,
+                  nonce,
+                  type: "eip1559" as const,
+                });
+                this.coldSignLatencyMs.push(performance.now() - coldSignStart);
+              } catch (error) {
+                if (nonce !== undefined) {
+                  this.primaryWalletCoordinator.rollbackNonce(lease, nonce);
+                }
+                throw error;
+              }
+            }
+
+            eventTimer.setSignComplete(candidateRef, reuseReason === "hit");
+            if (nonce === undefined) throw new Error("nonce unavailable after signing");
+            signedTxs.push({
+              signed,
+              prebuilt,
+              nonce,
+              maxFeePerGas,
+              maxPriorityFeePerGas,
+            });
+          }
+
+          this.batchCount += 1;
+          console.log(`${this.logTag}⚡ BATCH PRESIGN: ${hitCount}/${signedTxs.length}`);
+          console.log(
+            `${this.logTag}⚡ BATCH SIGNED: ${signedTxs.length} TXs (nonces ${signedTxs[0]?.nonce}-${signedTxs[signedTxs.length - 1]?.nonce})`,
+          );
+
+          const sendResults = await Promise.allSettled(
+            signedTxs.map(
+              async ({ signed, prebuilt, nonce, maxFeePerGas, maxPriorityFeePerGas }) => {
+                const candidateRef = toTimingCandidateRef(
+                  prebuilt.borrower,
+                  prebuilt.marketId,
+                  prebuilt.collateralSymbol,
+                );
+                eventTimer.setWouldSubmit(candidateRef);
+                const promises: Promise<string>[] = [
+                  submitOrShadow({
+                    path: "alchemy",
+                    triggerPath: "flashblock",
+                    candidateRef,
+                    gasParams: {
+                      nonce,
+                      gas: FLASHBLOCK_GAS_LIMIT,
+                      maxFeePerGas,
+                      maxPriorityFeePerGas,
+                    },
+                    serializedTx: signed,
+                    submit: () =>
+                      sendRawTransaction(this.primaryWalletCoordinator.client, {
+                        serializedTransaction: signed,
+                      }),
+                    createSyntheticResult: (syntheticTxHash) => syntheticTxHash,
+                  }),
+                ];
+                if (sequencerUrl) {
+                  promises.push(
+                    submitOrShadow({
+                      path: "sequencer",
+                      triggerPath: "flashblock",
+                      candidateRef,
+                      gasParams: {
+                        nonce,
+                        gas: FLASHBLOCK_GAS_LIMIT,
+                        maxFeePerGas,
+                        maxPriorityFeePerGas,
+                      },
+                      serializedTx: signed,
+                      metadata: { url: sequencerUrl },
+                      submit: () =>
+                        fetch(sequencerUrl, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({
+                            jsonrpc: "2.0",
+                            method: "eth_sendRawTransaction",
+                            params: [signed],
+                            id: 1,
+                          }),
+                          signal: AbortSignal.timeout(5_000),
+                        })
+                          .then((r) => r.json())
+                          .then((r: unknown) => {
+                            const res = r as { result?: string };
+                            if (!res.result?.startsWith("0x")) throw new Error("empty");
+                            return res.result;
+                          })
+                          .catch(() => {
+                            throw new Error("seq failed");
+                          }),
+                      createSyntheticResult: (syntheticTxHash) => syntheticTxHash,
+                    }),
                   );
-                })
-                .finally(() =>
-                  this.inFlightBorrowers.delete(
-                    `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
-                  ),
-                ),
+                }
+                if (this.bloxrouteConfig) {
+                  promises.push(
+                    submitOrShadow({
+                      path: "bloxroute",
+                      triggerPath: "flashblock",
+                      candidateRef,
+                      gasParams: {
+                        nonce,
+                        gas: FLASHBLOCK_GAS_LIMIT,
+                        maxFeePerGas,
+                        maxPriorityFeePerGas,
+                      },
+                      serializedTx: signed,
+                      submit: () => buildBloxroutePromise(this.bloxrouteConfig!, signed),
+                      createSyntheticResult: (syntheticTxHash) => syntheticTxHash,
+                    }),
+                  );
+                }
+                const txHash = await Promise.any(promises);
+                this.preSigner?.invalidate(prebuilt.borrower, prebuilt.marketId);
+                const broadcastedMs = Date.now();
+                console.log(
+                  `${this.logTag}⚡ BATCH TX SENT: ${prebuilt.borrower.slice(0, 10)}... ${prebuilt.collateralSymbol}/${prebuilt.loanSymbol} tx=${txHash} (nonce=${nonce})`,
+                );
+
+                const usd = estimateBorrowUsd(prebuilt);
+                if (this.canary) {
+                  const flashblockReceivedMs = Date.parse(event.detectedAt);
+                  const latencyMs = Number.isFinite(flashblockReceivedMs)
+                    ? broadcastedMs - flashblockReceivedMs
+                    : undefined;
+                  this.canary.recordResult({
+                    timestamp: broadcastedMs,
+                    eventDate: new Date(broadcastedMs).toISOString().slice(0, 10),
+                    type: "attempt",
+                    borrower: prebuilt.borrower,
+                    marketId: prebuilt.marketId,
+                    collateralSymbol: prebuilt.collateralSymbol,
+                    loanSymbol: prebuilt.loanSymbol ?? "",
+                    expectedBorrowUsd: usd,
+                    lltvWad: prebuilt.lltv,
+                    estimatedProfitUsd: 0,
+                    gasCostUsd: 0,
+                    actualProfitUsd: 0,
+                    txHash: txHash as Hex,
+                    priorityFeeGwei: Number(estimatePriorityFeeWei(prebuilt)) / 1e9,
+                    broadcastedMs,
+                    flashblockReceivedMs: Number.isFinite(flashblockReceivedMs)
+                      ? flashblockReceivedMs
+                      : undefined,
+                    latencyMs,
+                  });
+                  this.verifyBatchReceipt(txHash as Hex, prebuilt, usd).catch(() => {});
+                }
+                this.shadowLogger?.recordAttempt({
+                  borrower: prebuilt.borrower,
+                  marketId: prebuilt.marketId,
+                  collateralSymbol: prebuilt.collateralSymbol,
+                  loanSymbol: prebuilt.loanSymbol ?? "",
+                  ourTxHash: txHash as Hex,
+                  ourTipWei: maxPriorityFeePerGas,
+                  ourMaxFeePerGasWei: maxFeePerGas,
+                  ourSentBlock: BigInt(event.blockNumber),
+                  ourSentMs: broadcastedMs,
+                  expectedProfitUsd: usd,
+                  flashblockReceivedMs: Number.isFinite(Date.parse(event.detectedAt))
+                    ? Date.parse(event.detectedAt)
+                    : undefined,
+                });
+                return txHash;
+              },
             ),
           );
+
+          let sent = 0;
+          let failed = 0;
+          for (const result of sendResults) {
+            if (result.status === "fulfilled") sent++;
+            else failed++;
+          }
+          console.log(`${this.logTag}⚡ BATCH RESULT: ${sent} sent, ${failed} failed`);
+          discord
+            .notifyBatchResult(sent, failed, symbolPatterns.join(",") || "unknown")
+            .catch((e: unknown) => {
+              console.error("[notify]", e instanceof Error ? e.message : e);
+            });
+
+          if (failed > 0) {
+            this.primaryWalletCoordinator.resetNonceCache(lease);
+          }
         })()
           .catch((e: unknown) => {
-            console.error(
-              `${this.logTag}Fresh path HF gate error:`,
-              e instanceof Error ? e.message : e,
-            );
+            console.error(`${this.logTag}Batch error:`, e instanceof Error ? e.message : String(e));
+            this.primaryWalletCoordinator.resetNonceCache(lease);
           })
           .finally(() => {
-            // Cleanup any remaining inFlightBorrowers entries not already cleaned by filter or fastLiquidate.finally.
-            // Safe to call unconditionally — Set.delete is a no-op for missing keys.
-            for (const c of cacheMisses) {
+            this.isBatchInFlight = false;
+            this.primaryWalletCoordinator.release(lease);
+            for (const { candidate: c } of allCacheHitsSnapshot) {
               this.inFlightBorrowers.delete(
                 `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
               );
             }
+            eventTimer.flush();
           });
-      } else {
-        // Batch is running — release cache-miss borrowers without firing (avoid nonce race)
-        for (const c of cacheMisses) {
-          this.inFlightBorrowers.delete(
-            `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
-          );
+        return;
+      }
+
+      void (async () => {
+        let activeMisses = cacheMisses;
+        if (isRateFeed && cacheMisses.length > 0) {
+          const oraclePricesFresh = new Map<string, bigint>();
+          const oracleReadFailedFresh = new Set<string>();
+          for (const c of cacheMisses) {
+            const oracleAddr = c.position.oracle.toLowerCase();
+            if (!oraclePricesFresh.has(oracleAddr) && !oracleReadFailedFresh.has(oracleAddr)) {
+              try {
+                const price = await readContract(this.primaryWalletCoordinator.client, {
+                  address: c.position.oracle,
+                  abi: ORACLE_PRICE_ABI,
+                  functionName: "price",
+                });
+                oraclePricesFresh.set(oracleAddr, price);
+              } catch (err) {
+                // Fail-closed: cannot verify HF, skip to avoid revert on false positive.
+                // RATE_FEED cache-miss candidates have ~high false-positive rate from blue-api lag.
+                oracleReadFailedFresh.add(oracleAddr);
+                console.warn(
+                  `${this.logTag}⚡ RATE FEED (fresh) oracle read failed for ${oracleAddr} — skipping candidates (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+          }
+          activeMisses = cacheMisses.filter((c) => {
+            const oracleAddr = c.position.oracle.toLowerCase();
+            if (oracleReadFailedFresh.has(oracleAddr)) {
+              eventTimer.setSkipped(
+                toTimingCandidateRef(
+                  c.position.borrower,
+                  c.position.marketId,
+                  c.position.collateralSymbol,
+                ),
+                "gate-fail",
+              );
+              this.inFlightBorrowers.delete(
+                `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+              );
+              return false;
+            }
+            const oraclePrice = oraclePricesFresh.get(oracleAddr);
+            if (!oraclePrice) return true;
+            const hf = calculateHF(
+              c.position.collateral,
+              c.position.borrowShares,
+              c.position.totalBorrowAssets,
+              c.position.totalBorrowShares,
+              oraclePrice,
+              c.position.lltv,
+            );
+            if (hf >= WAD) {
+              console.log(
+                `${this.logTag}⚡ RATE FEED HF GATE (fresh): ${c.position.borrower.slice(0, 10)}... ` +
+                  `${c.position.collateralSymbol}/${c.position.loanSymbol} ` +
+                  `HF=${(Number(hf) / 1e18).toFixed(6)} ≥ 1.0 — BLOCKED (false positive)`,
+              );
+              eventTimer.setSkipped(
+                toTimingCandidateRef(
+                  c.position.borrower,
+                  c.position.marketId,
+                  c.position.collateralSymbol,
+                ),
+                "gate-fail",
+              );
+              this.inFlightBorrowers.delete(
+                `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+              );
+              return false;
+            }
+            return true;
+          });
         }
+        await Promise.allSettled(
+          activeMisses.map((c) => {
+            const candidateRef = toTimingCandidateRef(
+              c.position.borrower,
+              c.position.marketId,
+              c.position.collateralSymbol,
+            );
+            eventTimer.setWouldSubmit(candidateRef);
+            return this.bot
+              .fastLiquidate(c.position, c.seizableCollateral, c.borrowAssets)
+              .catch((e: unknown) => {
+                console.error(
+                  `${this.logTag}Fast liquidate error:`,
+                  e instanceof Error ? e.message : e,
+                );
+              })
+              .finally(() => {
+                this.inFlightBorrowers.delete(
+                  `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+                );
+              });
+          }),
+        );
+      })()
+        .catch((e: unknown) => {
+          console.error(
+            `${this.logTag}Fresh path HF gate error:`,
+            e instanceof Error ? e.message : e,
+          );
+        })
+        .finally(() => {
+          for (const c of cacheMisses) {
+            this.inFlightBorrowers.delete(
+              `${c.position.borrower.toLowerCase()}:${c.position.marketId}`,
+            );
+          }
+          eventTimer.flush();
+        });
+    }
+  }
+
+  private handlePendingOracleUpdate(event: OracleUpdateEvent): void {
+    const pendingTimer = createEventTimer("pending-prewarm", {
+      oracleAddress: event.aggregatorAddress,
+      oracleBlockNumber: event.blockNumber ?? 0,
+    });
+    pendingTimer.setHandlerDispatch();
+
+    if (
+      this.preSigner === undefined ||
+      this.pendingPrewarmFeeds === undefined ||
+      Object.keys(this.pendingPrewarmFeeds).length === 0
+    ) {
+      return;
+    }
+
+    const now = Date.now();
+    for (const [key, seenAt] of this.pendingSeenTxs) {
+      if (now - seenAt >= PENDING_PREWARM_TTL_MS) {
+        this.pendingSeenTxs.delete(key);
       }
     }
+
+    const aggregatorAddress = event.aggregatorAddress.toLowerCase();
+    const feed = this.pendingPrewarmFeeds[aggregatorAddress];
+    if (feed === undefined) return;
+
+    const dedupKey = `${aggregatorAddress}:${event.rawTx}`;
+    const seenAt = this.pendingSeenTxs.get(dedupKey);
+    if (seenAt !== undefined && now - seenAt < PENDING_PREWARM_TTL_MS) return;
+    this.pendingSeenTxs.set(dedupKey, now);
+
+    const allowedMarketIds = new Set(feed.marketIds.map((marketId) => marketId.toLowerCase()));
+    const candidates = this.positionCache
+      .findNearLiquidation(1.05)
+      .filter((candidate) => allowedMarketIds.has(candidate.position.marketId.toLowerCase()));
+    const topCandidate = candidates[0];
+    if (topCandidate === undefined) return;
+
+    const candidateRef = toTimingCandidateRef(
+      topCandidate.position.borrower,
+      topCandidate.position.marketId,
+      topCandidate.position.collateralSymbol,
+    );
+    pendingTimer.addCandidate(candidateRef);
+
+    if (this.primaryWalletCoordinator.isBusy) {
+      pendingTimer.setSkipped(candidateRef, "busy-wallet");
+      pendingTimer.flush();
+      return;
+    }
+
+    console.log(
+      `${this.logTag}[PendingPrewarm] feed=${feed.feedName} aggregator=${aggregatorAddress} ` +
+        `borrower=${topCandidate.position.borrower} market=${topCandidate.position.marketId} candidates=${candidates.length}`,
+    );
+
+    void this.prewarmPendingCandidate(
+      topCandidate.position.borrower,
+      topCandidate.position.marketId,
+      topCandidate.position.collateralSymbol,
+      pendingTimer,
+    )
+      .catch((error: unknown) => {
+        console.error(
+          `${this.logTag}[PendingPrewarm] error:`,
+          error instanceof Error ? error.message : error,
+        );
+      })
+      .finally(() => {
+        pendingTimer.flush();
+      });
+  }
+
+  private async prewarmPendingCandidate(
+    borrower: `0x${string}`,
+    marketId: Hex,
+    collateralSymbol: string,
+    pendingTimer: EventTimer,
+  ): Promise<void> {
+    if (this.preSigner === undefined) return;
+
+    await this.txCache.rebuildOne(borrower, marketId);
+    const prebuilt = this.txCache.get(borrower, marketId);
+    if (prebuilt === undefined) {
+      pendingTimer.setSkipped(
+        toTimingCandidateRef(borrower, marketId, collateralSymbol),
+        "no-cache",
+      );
+      return;
+    }
+    pendingTimer.setCalldataReady(
+      toTimingCandidateRef(borrower, marketId, prebuilt.collateralSymbol),
+    );
+
+    const calldata = TxCache.encodeCalldata(prebuilt);
+
+    const nonce = await this.primaryWalletCoordinator.reserveNonce(
+      `pending-prewarm:${borrower.toLowerCase()}:${marketId}`,
+      PRESIGN_MAX_AGE_MS,
+    );
+    const { maxFeePerGas, maxPriorityFeePerGas } = await getPollGasParams(
+      this.primaryWalletCoordinator.client,
+      prebuilt,
+    );
+
+    try {
+      await this.preSigner.presign(
+        borrower,
+        marketId,
+        calldata,
+        nonce,
+        POLL_GAS_LIMIT,
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+      );
+    } catch (error) {
+      this.primaryWalletCoordinator.releaseReservedNonce(nonce);
+      throw error;
+    }
+    pendingTimer.setSignComplete(
+      toTimingCandidateRef(borrower, marketId, prebuilt.collateralSymbol),
+      false,
+    );
   }
 
   /** Timing probe: dual-path (wallet RPC vs sequencer direct) latency measurement */
@@ -822,6 +1298,7 @@ export class FlashblockHandler {
     const now = Date.now();
     if (now - this.lastProbeMs < 60_000) return;
     this.lastProbeMs = now;
+    if (isShadowMode()) return;
 
     const lease = this.primaryWalletCoordinator.tryAcquire("timing-probe");
     if (lease === null) return;

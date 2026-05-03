@@ -25,6 +25,7 @@ import {
   type PrimaryWalletCoordinator,
   type PrimaryWalletLease,
 } from "./primary-wallet-coordinator";
+import { isShadowOnly, makeSyntheticTxHash } from "./utils/shadow-runtime.js";
 
 const WETH = "0x4200000000000000000000000000000000000006" as Address;
 const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address;
@@ -77,6 +78,7 @@ export class AutoRefuel {
   private readonly primaryWalletCoordinator?: PrimaryWalletCoordinator;
   private wallets: WalletInfo[] = [];
   private interval: ReturnType<typeof setInterval> | null = null;
+  private readonly shadowSkipWarnedWallets = new Set<Address>();
 
   constructor(config: AutoRefuelConfig) {
     this.logTag = config.logTag;
@@ -209,8 +211,11 @@ export class AutoRefuel {
           const ETH_PRICE_USD_CONSERVATIVE = 3500n;
           const SLIPPAGE_NUM = 9n;
           const SLIPPAGE_DEN = 10n;
+          // USDC (6-dec) → WETH (18-dec) scale = 1e12 (NOT 1e13).
+          // Formula: WETH_wei = USDC_wei * 1e12 / price_usd, then × 0.9 slippage.
+          const USDC_TO_WETH_SCALE = 1_000_000_000_000n;
           const amountOutMinimum =
-            (actualSpend * 10_000_000_000_000n * SLIPPAGE_NUM) /
+            (actualSpend * USDC_TO_WETH_SCALE * SLIPPAGE_NUM) /
             (ETH_PRICE_USD_CONSERVATIVE * SLIPPAGE_DEN);
           swapTx = await this.writeContract(walletClient, lease, {
             address: SWAP_ROUTER,
@@ -292,6 +297,24 @@ export class AutoRefuel {
     lease: PrimaryWalletLease | null,
     args: Parameters<WalletClient<Transport, Chain, Account>["writeContract"]>[0],
   ): Promise<Hex> {
+    if (isShadowOnly()) {
+      const address = walletClient.account.address;
+      if (!this.shadowSkipWarnedWallets.has(address)) {
+        this.shadowSkipWarnedWallets.add(address);
+        console.warn(
+          `${this.logTag}AutoRefuel: shadow-only mode active; skipping on-chain refuel writes for ${address}`,
+        );
+      }
+      return makeSyntheticTxHash(
+        JSON.stringify({
+          address,
+          functionName: args.functionName,
+          leaseOwner: lease?.owner ?? null,
+          ts: Date.now(),
+        }),
+      );
+    }
+
     // Explicit gas price to avoid viem's EIP-1559 default (baseFee + 2.5 gwei priority)
     // which inflates cost estimate and triggers "total cost exceeds balance" on low-ETH wallets.
     // Base mainnet baseFee ~0.005 gwei; 0.1 gwei cap is 20x headroom and costs <0.00003 ETH/TX.
@@ -299,7 +322,10 @@ export class AutoRefuel {
       maxFeePerGas: 100_000_000n, // 0.1 gwei
       maxPriorityFeePerGas: 10_000_000n, // 0.01 gwei
     };
-    if (lease === null) return walletClient.writeContract({ ...args, ...gasOverrides });
+    if (lease === null)
+      return walletClient.writeContract({ ...args, ...gasOverrides } as Parameters<
+        WalletClient<Transport, Chain, Account>["writeContract"]
+      >[0]);
     if (this.primaryWalletCoordinator === undefined)
       throw new Error("Primary coordinator is required for wallet[0]");
 

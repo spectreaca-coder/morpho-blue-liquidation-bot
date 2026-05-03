@@ -1,7 +1,36 @@
 import { arbitrum, base, katana, mainnet, unichain, worldchain } from "viem/chains";
 
 import { hyperevm, monad } from "./chains";
-import type { Config } from "./types";
+import { CBXRP_POOL_AWARE_CONFIG } from "./liquidityVenues/uniswapV3";
+import type { Config, PendingPrewarmFeedMap } from "./types";
+
+// Harness: optionally append a custom market ID (MockOracle-based) for Base chain.
+// Only enabled when HARNESS_CUSTOM_MARKET_ID env var is set to a valid 0x-prefixed 66-char hex.
+function getHarnessCustomMarketId(): `0x${string}` | undefined {
+  const raw = process.env.HARNESS_CUSTOM_MARKET_ID;
+  if (!raw) return undefined;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(raw)) return undefined;
+  return raw as `0x${string}`;
+}
+
+const HARNESS_MARKET = getHarnessCustomMarketId();
+const BASE_CBXRP_MARKET_ID = CBXRP_POOL_AWARE_CONFIG[base.id]?.marketId;
+
+const BASE_PENDING_PREWARM_FEEDS: PendingPrewarmFeedMap = {
+  "0x0e3dc8a6a86d2f6f5f67b373a047c267fb1fc3e6": {
+    feedName: "BTC/USD",
+    marketIds: [
+      "0x9103c3b4e834476c9a62ea009ba2c884ee42e94e6e314a26f04d312434191836", // cbBTC/USDC
+    ],
+  },
+  "0x1e0b2c3896338fbb201c4f0a27c6904801dca06b": {
+    feedName: "ETH/USD",
+    marketIds: [
+      "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda", // WETH/USDC
+      "0x1c21c59df9db44bf6f645d854ee710a8ca17b479451447e9f56758aee10a2fad", // cbETH/USDC
+    ],
+  },
+};
 
 /// Bad debt realization
 
@@ -51,7 +80,7 @@ export const chainConfigs: Record<number, Config> = {
       dataProvider: "morphoApi",
       vaultWhitelist: "morpho-api",
       additionalMarketsWhitelist: [
-        "0xd4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109", // cbXRP/USDC $138K/7d
+        BASE_CBXRP_MARKET_ID!, // cbXRP/USDC $138K/7d
         "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda", // WETH/USDC $66K/7d
         "0xd7520ad198b497b6eb75bc690268f4597630dbc12e305e9d4105843bab36e41d", // cbADA/USDC $6K/7d
         "0x9125d0fa03c3137166df68bcc72283477830de2a4a5536512374c573ad4583c3", // cbLTC/USDC $5.4K/7d
@@ -60,12 +89,14 @@ export const chainConfigs: Record<number, Config> = {
         "0x214c2bf3c899c913efda9c4a49adff23f77bbc2dc525af7c05be7ec93f32d561", // wrsETH/WETH — UniswapV3 3000 fee tier (1 wrsETH = 1.06 WETH)
         "0x9103c3b4e834476c9a62ea009ba2c884ee42e94e6e314a26f04d312434191836", // cbBTC/USDC (main market)
         "0x1c21c59df9db44bf6f645d854ee710a8ca17b479451447e9f56758aee10a2fad", // cbETH/USDC
+        "0x0ca10126f6c94cbd9cf0a48cc9516ae5e3dec5aa68303e6d988ee37c5149bf0d", // cbETH/USDC alternate $26K/30d seized
+        ...(HARNESS_MARKET ? [HARNESS_MARKET] : []),
       ],
       liquidityVenues: [
         "erc20Wrapper",
         "erc4626",
-        "aerodromeV3",
         "uniswapV3",
+        "aerodromeV3",
         "1inch",
         "pendlePT",
         "midas",
@@ -76,6 +107,11 @@ export const chainConfigs: Record<number, Config> = {
       useL2PriorityBidding: true,
       useFastPath: true,
       blockInterval: 50, // ~100s fallback (FlashblockWatcher + CEX Predictor are main paths)
+      quoteGateEnabled: true,
+      quoteRaceEnabled: true,
+      quoteGateBufferBps: 500, // 5% buffer over repaidAssets before accepting swap output
+      cbXrpPoolAware: CBXRP_POOL_AWARE_CONFIG[base.id],
+      pendingPrewarmFeeds: BASE_PENDING_PREWARM_FEEDS,
     },
   },
   [unichain.id]: {

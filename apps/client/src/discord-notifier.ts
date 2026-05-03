@@ -80,14 +80,26 @@ export class DiscordNotifier {
     borrower: string,
     txHash: string,
     walletIndex: number,
+    shadowMode = false,
   ): Promise<void> {
-    await this.send(
-      `⚡ **TX 발사!**\n` +
-        `> Market: **${market}**\n` +
-        `> Borrower: \`${borrower.slice(0, 10)}...\`\n` +
-        `> Wallet: #${walletIndex}\n` +
-        `> TX: \`${txHash}\``,
-    );
+    if (shadowMode) {
+      await this.send(
+        `🔍 **SHADOW TX (not submitted)**\n` +
+          `> Market: **${market}**\n` +
+          `> Borrower: \`${borrower.slice(0, 10)}...\`\n` +
+          `> Wallet: #${walletIndex}\n` +
+          `> TX: \`${txHash}\` *(synthetic)*\n` +
+          `> ⚠️ SHADOW MODE — tx NOT submitted on-chain`,
+      );
+    } else {
+      await this.send(
+        `⚡ **TX 발사!**\n` +
+          `> Market: **${market}**\n` +
+          `> Borrower: \`${borrower.slice(0, 10)}...\`\n` +
+          `> Wallet: #${walletIndex}\n` +
+          `> TX: \`${txHash}\``,
+      );
+    }
   }
 
   /** Revert (normal — position was healthy) */

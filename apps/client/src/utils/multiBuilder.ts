@@ -1,6 +1,8 @@
 import type { Hex, LocalAccount } from "viem";
 import { keccak256, stringToBytes } from "viem";
 
+import { submitBundleOrShadow, type ShadowSubmitMetadata } from "./txSubmitter.js";
+
 /**
  * Builder relay endpoint configuration.
  */
@@ -158,9 +160,22 @@ export class MultiBuilderSubmitter {
    *
    * @param account - LocalAccount used to sign the X-Flashbots-Signature header.
    *                  This is the same auth signer used for Flashbots relay.
+   * @param chainId - Chain ID. Must be 1 (ETH mainnet) — the DEFAULT_BUILDERS list
+   *                  contains only mainnet relays, and submitting Base/L2 bundles
+   *                  to them would silently leak signed txs.
    * @param builders - Builder configurations (defaults to all major ETH mainnet builders)
    */
-  constructor(account: LocalAccount, builders: BuilderConfig[] = DEFAULT_BUILDERS) {
+  constructor(
+    account: LocalAccount,
+    chainId: number,
+    builders: BuilderConfig[] = DEFAULT_BUILDERS,
+  ) {
+    if (chainId !== 1) {
+      throw new Error(
+        `MultiBuilderSubmitter is ETH mainnet only (chainId=1); got chainId=${chainId}. ` +
+          `DEFAULT_BUILDERS targets Flashbots/Titan/rsync/beaverbuild — using on L2 leaks signed txs.`,
+      );
+    }
     this.account = account;
     this.builders = builders;
   }
@@ -179,65 +194,95 @@ export class MultiBuilderSubmitter {
   async sendBundle(
     signedTransactions: Hex[],
     targetBlockNumber: bigint,
+    shadowContext?: ShadowSubmitMetadata,
   ): Promise<MultiBuilderResult> {
-    const body = JSON.stringify({
-      method: "eth_sendBundle",
-      params: [
-        {
-          txs: signedTransactions,
-          blockNumber: `0x${targetBlockNumber.toString(16)}`,
-        },
-      ],
-      id: nextRpcId++,
-      jsonrpc: "2.0",
+    return submitBundleOrShadow<MultiBuilderResult>({
+      path: "flashbots-bundle",
+      ...shadowContext,
+      bundle: {
+        txCount: signedTransactions.length,
+        targetBlockNumber: targetBlockNumber.toString(),
+        blockCount: shadowContext?.bundle?.blockCount ?? 1,
+      },
+      metadata: {
+        relay: "multi-builder",
+        builders: this.builders.map((builder) => builder.name),
+        ...(shadowContext?.metadata ?? {}),
+      },
+      // Forensic outcome: prefer the first accepted bundleHash; null if no path
+      // accepted. Status (accepted/error) is set by submitOrShadow's success
+      // path, so a 0-acceptance result still records as "accepted" — distinguish
+      // via acceptedCount in metadata downstream rather than flipping status.
+      extractOutcome: (result) => {
+        const winner = result.results.find((r) => r.accepted && r.bundleHash);
+        return { txHash: winner?.bundleHash ?? null };
+      },
+      submit: async () => {
+        const body = JSON.stringify({
+          method: "eth_sendBundle",
+          params: [
+            {
+              txs: signedTransactions,
+              blockNumber: `0x${targetBlockNumber.toString(16)}`,
+            },
+          ],
+          id: nextRpcId++,
+          jsonrpc: "2.0",
+        });
+
+        const signatureHeader = await buildSignatureHeader(body, this.account);
+        const settled = await Promise.allSettled(
+          this.builders.map((builder) => submitToBuilder(builder, body, signatureHeader)),
+        );
+
+        const results: BuilderSubmitResult[] = settled.map((outcome, index) => {
+          if (outcome.status === "fulfilled") {
+            return outcome.value;
+          }
+          return {
+            builder: this.builders[index]?.name ?? "unknown",
+            accepted: false,
+            error:
+              outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason),
+            latencyMs: 0,
+          };
+        });
+
+        const acceptedCount = results.filter((r) => r.accepted).length;
+        const rejectedCount = results.length - acceptedCount;
+        const acceptedBuilders = results
+          .filter((r) => r.accepted)
+          .map((r) => `${r.builder}(${r.latencyMs}ms)`)
+          .join(", ");
+        const rejectedBuilders = results
+          .filter((r) => !r.accepted)
+          .map((r) => `${r.builder}(${r.error})`)
+          .join(", ");
+
+        if (acceptedCount > 0) {
+          console.log(
+            `[MultiBuilder] Bundle accepted by ${acceptedCount}/${results.length}: ${acceptedBuilders}`,
+          );
+        }
+        if (rejectedCount > 0) {
+          console.warn(
+            `[MultiBuilder] Bundle rejected by ${rejectedCount}/${results.length}: ${rejectedBuilders}`,
+          );
+        }
+
+        return { results, acceptedCount, rejectedCount };
+      },
+      createSyntheticResult: (syntheticTxHash) => ({
+        results: this.builders.map((builder) => ({
+          builder: builder.name,
+          accepted: true,
+          bundleHash: syntheticTxHash,
+          latencyMs: 0,
+        })),
+        acceptedCount: this.builders.length,
+        rejectedCount: 0,
+      }),
     });
-
-    // Sign once, reuse for all builders (same signature scheme)
-    const signatureHeader = await buildSignatureHeader(body, this.account);
-
-    // Submit to all builders in parallel
-    const settled = await Promise.allSettled(
-      this.builders.map((builder) => submitToBuilder(builder, body, signatureHeader)),
-    );
-
-    const results: BuilderSubmitResult[] = settled.map((outcome, index) => {
-      if (outcome.status === "fulfilled") {
-        return outcome.value;
-      }
-      // Promise.allSettled rejection (should not happen since submitToBuilder catches)
-      return {
-        builder: this.builders[index]?.name ?? "unknown",
-        accepted: false,
-        error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason),
-        latencyMs: 0,
-      };
-    });
-
-    const acceptedCount = results.filter((r) => r.accepted).length;
-    const rejectedCount = results.length - acceptedCount;
-
-    // Log summary
-    const acceptedBuilders = results
-      .filter((r) => r.accepted)
-      .map((r) => `${r.builder}(${r.latencyMs}ms)`)
-      .join(", ");
-    const rejectedBuilders = results
-      .filter((r) => !r.accepted)
-      .map((r) => `${r.builder}(${r.error})`)
-      .join(", ");
-
-    if (acceptedCount > 0) {
-      console.log(
-        `[MultiBuilder] Bundle accepted by ${acceptedCount}/${results.length}: ${acceptedBuilders}`,
-      );
-    }
-    if (rejectedCount > 0) {
-      console.warn(
-        `[MultiBuilder] Bundle rejected by ${rejectedCount}/${results.length}: ${rejectedBuilders}`,
-      );
-    }
-
-    return { results, acceptedCount, rejectedCount };
   }
 
   /**
@@ -255,13 +300,21 @@ export class MultiBuilderSubmitter {
     signedTransactions: Hex[],
     startBlockNumber: bigint,
     blockCount = 3,
+    shadowContext?: ShadowSubmitMetadata,
   ): Promise<{ targetBlock: bigint; result: MultiBuilderResult }[]> {
     const allResults: { targetBlock: bigint; result: MultiBuilderResult }[] = [];
 
     // Submit to all target blocks in parallel
     const submissions = Array.from({ length: blockCount }, (_, i) => {
       const targetBlock = startBlockNumber + BigInt(i);
-      return this.sendBundle(signedTransactions, targetBlock).then((result) => ({
+      return this.sendBundle(signedTransactions, targetBlock, {
+        ...shadowContext,
+        bundle: {
+          txCount: signedTransactions.length,
+          targetBlockNumber: targetBlock.toString(),
+          blockCount,
+        },
+      }).then((result) => ({
         targetBlock,
         result,
       }));

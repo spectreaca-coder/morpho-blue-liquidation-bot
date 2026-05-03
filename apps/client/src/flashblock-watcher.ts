@@ -15,7 +15,9 @@
 import { brotliDecompressSync } from "zlib";
 
 type WSConstructor = new (url: string) => {
-  on: (event: string, cb: (...args: unknown[]) => void) => void;
+  on(event: "message", cb: (data: Buffer, isBinary: boolean) => void): void;
+  on(event: "error", cb: (err: unknown) => void): void;
+  on(event: string, cb: (...args: unknown[]) => void): void;
   send: (data: string) => void;
   close: () => void;
 };
@@ -43,6 +45,8 @@ export interface OracleUpdateEvent {
   detectedAt: string;
   /** Raw TX hex for potential price extraction */
   rawTx: string;
+  /** High-resolution wall-clock timestamp captured at oracle-match time. */
+  receivedAtMs?: number;
   /**
    * Median price extracted from the OCR2 transmit report, in Chainlink's
    * native 8-decimal format (e.g. BTC at $84,000 → 8400000000000n).
@@ -227,6 +231,7 @@ export class FlashblockWatcher {
               flashblockIndex,
               detectedAt: new Date().toISOString(),
               rawTx,
+              receivedAtMs: Date.now(),
               extractedPrice,
             });
           }
@@ -257,8 +262,11 @@ export class FlashblockWatcher {
       this.scheduleReconnect();
     });
 
-    this.ws.on("error", (err: Error) => {
-      console.error(`${this.logTag}FlashblockWatcher: error:`, err.message);
+    this.ws.on("error", (err: unknown) => {
+      console.error(
+        `${this.logTag}FlashblockWatcher: error:`,
+        err instanceof Error ? err.message : String(err),
+      );
       this.ws?.close();
     });
   }
@@ -578,6 +586,7 @@ export class FlashblockWatcher {
           detectedAt: new Date().toISOString(),
           rawTx: tx.input,
           extractedPrice: undefined,
+          source: "alchemy-pending",
         });
         // Do NOT touch lastFlashblockMessageMs here — a healthy Alchemy stream must not
         // mask a dead primary flashblock stream from the heartbeat.
@@ -594,8 +603,11 @@ export class FlashblockWatcher {
         this.connectAlchemy();
       }, 5000);
     });
-    this.alchemyWs.on("error", (err: Error) => {
-      console.error(`${this.logTag}AlchemyWatcher: error`, err.message);
+    this.alchemyWs.on("error", (err: unknown) => {
+      console.error(
+        `${this.logTag}AlchemyWatcher: error`,
+        err instanceof Error ? err.message : String(err),
+      );
       this.alchemyWs?.close();
     });
   }

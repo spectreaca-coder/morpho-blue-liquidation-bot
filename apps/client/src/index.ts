@@ -11,8 +11,12 @@ import { createPricer } from "@morpho-blue-liquidation-bot/pricers";
 import {
   createPublicClient,
   createWalletClient,
+  type Account,
   type Address,
+  type Chain,
   type Hex,
+  type Transport,
+  type WalletClient,
   fallback,
   http,
   webSocket,
@@ -22,7 +26,7 @@ import { watchBlocks } from "viem/actions";
 
 import { AutoRefuel } from "./auto-refuel";
 import { LiquidationBot, type LiquidationBotInputs } from "./bot";
-import { CanaryTracker, loadCanaryConfigFromEnv } from "./canary";
+import { CanaryTracker, estimateLiquidationProfitUsd, loadCanaryConfigFromEnv } from "./canary";
 import {
   CexPredictor,
   ORACLE_TO_CEX_MAP,
@@ -30,12 +34,26 @@ import {
   type ThresholdCrossing,
   type LiquidationThreshold,
 } from "./cex-predictor";
+import { CompetitorIntelLogger } from "./competitorIntelLogger.js";
 import { discord } from "./discord-notifier";
 import { FlashblockHandler } from "./flashblock-handler";
 import { FlashblockWatcher, BASE_AGGREGATORS } from "./flashblock-watcher";
 import { SKIP_SYMBOLS, MIN_BORROW_USDC_6DEC, MIN_BORROW_WETH_18DEC } from "./liquidation-constants";
+import { startMorphoEventWatcher } from "./morpho-event-watcher";
 import { NonceManager } from "./nonce-manager";
+import {
+  AlchemySubmitter,
+  AnkrSubmitter,
+  BloxrouteSubmitter,
+  ParallelSubmitter,
+} from "./parallel-submitter.js";
+import {
+  POLL_GAS_LIMIT,
+  getPollGasParams,
+  startPollLiquidationTrigger,
+} from "./poll-liquidation-trigger.js";
 import { PositionCache } from "./position-cache";
+import { PreSigner } from "./preSigner.js";
 import { PrimaryWalletCoordinator } from "./primary-wallet-coordinator";
 import { ShadowLogger } from "./shadow-logger";
 import { TxCache } from "./tx-cache";
@@ -43,26 +61,39 @@ import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
 } from "./utils/cooldownMechanisms";
-import { MORPHO_BLUE } from "./utils/selfFundingTip";
+import { getMinBorrowUsdc6Dec, isHarnessBypassActive } from "./utils/harness-filter-bypass.js";
+import { MORPHO_BLUE } from "./utils/morphoConstants";
+import { createEventTimer } from "./utils/shadowTimingLogger.js";
 import { WalletPool } from "./wallet-pool";
 
 export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
   const logTag = `[${config.chain.name} client]: `;
   console.log(`${logTag}Starting up`);
 
+  type BotWalletClient = WalletClient<Transport, Chain, Account>;
   const client = createWalletClient({
     chain: config.chain,
     transport: config.fallbackRpcUrl
       ? fallback([http(config.rpcUrl), http(config.fallbackRpcUrl)])
       : http(config.rpcUrl),
     account: privateKeyToAccount(config.liquidationPrivateKey),
-  });
+  }) as BotWalletClient;
   const publicClient = createPublicClient({
     chain: config.chain,
     transport: config.fallbackRpcUrl
       ? fallback([http(config.rpcUrl), http(config.fallbackRpcUrl)])
       : http(config.rpcUrl),
   });
+
+  // WS client for event subscriptions (MockOracle, Morpho events).
+  // eth_subscribe is near-zero CU cost vs HTTP polling.
+  // Falls back to undefined if no WS URL configured → watchers use HTTP poll.
+  const wsPublicClient = config.wsUrl
+    ? createPublicClient({ chain: config.chain, transport: webSocket(config.wsUrl) })
+    : undefined;
+  if (wsPublicClient) {
+    console.log(`${logTag}WS event subscription client ready: ${config.wsUrl}`);
+  }
 
   // WALLET POOL — multi-wallet support
   // Primary wallet (index 0) always exists. Additional wallets are optional:
@@ -75,7 +106,7 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
   const walletAffinities = config.walletAffinities ?? defaultAffinities;
 
   const walletEntries: {
-    client: ReturnType<typeof createWalletClient>;
+    client: BotWalletClient;
     executorAddress: Address;
     marketAffinity: string[];
   }[] = [
@@ -101,7 +132,7 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
         ? fallback([http(config.rpcUrl), http(config.fallbackRpcUrl)])
         : http(config.rpcUrl),
       account: privateKeyToAccount(pk as Hex),
-    });
+    }) as BotWalletClient;
 
     walletEntries.push({
       client: additionalClient,
@@ -130,6 +161,18 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     ourExecutorAddresses: executorAddresses,
     logTag,
   });
+
+  const competitorIntel = new CompetitorIntelLogger({ publicClient });
+
+  // PARALLEL SUBMITTER — raw signed-tx lane used by CEX presigned hot path.
+  const parallelSubmitter = new ParallelSubmitter({
+    submitters: [new AlchemySubmitter(publicClient), new BloxrouteSubmitter(), new AnkrSubmitter()],
+    logger: competitorIntel,
+    logTag,
+  });
+  console.log(
+    `${logTag}[ParallelSubmitter] enabled paths: alchemy${process.env.BLXR_AUTH_HEADER || process.env.BLOXROUTE_BASE_AUTH ? ", bloxroute" : ""}${process.env.RPC_URL_FALLBACK_8453 ? ", ankr" : ""}`,
+  );
 
   // LIQUIDITY VENUES
   const liquidityVenues = config.liquidityVenues.map((liquidityVenueName) =>
@@ -208,24 +251,77 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
 
   // FAST PATH — PositionCache + CEX Predictor (all chains with useFastPath)
   if (config.useFastPath) {
+    const harnessPollEnabled = isHarnessBypassActive(config.chainId);
     // Position cache must be created before CEX predictor (used in CEX callback)
     const marketIds = [...config.additionalMarketsWhitelist.map((id) => id as string)];
     const positionCache = new PositionCache(
       logTag,
       config.chainId,
       marketIds.length > 0 ? marketIds : undefined,
+      publicClient,
     );
     positionCache.start(30_000);
+
+    const preSigner = new PreSigner(
+      primaryWalletCoordinator.client,
+      primaryWalletCoordinator.executorAddress,
+      { maxCacheAge: 12 * 60_000 },
+    );
+    console.log(
+      `${logTag}PreSigner: created for executor=${primaryWalletCoordinator.executorAddress}`,
+    );
 
     // TX CACHE — pre-builds liquidation calldata for near-liquidation positions
     const txCache = new TxCache({
       logTag,
       chainId: config.chainId,
       client,
+      positionCache,
       executorAddress: config.executorAddress,
       treasuryAddress: config.treasuryAddress ?? client.account.address,
       liquidityVenues,
       liquidationBufferBps: config.liquidationBufferBps,
+      quoteGateEnabled: config.quoteGateEnabled,
+      quoteRaceEnabled: config.quoteRaceEnabled,
+      quoteGateBufferBps: config.quoteGateBufferBps,
+      onBuildComplete: harnessPollEnabled
+        ? async (prebuilt) => {
+            const nonce = await primaryWalletCoordinator.reserveNonce(
+              `harness-presign:${prebuilt.borrower.toLowerCase()}:${prebuilt.marketId}`,
+              30_000,
+            );
+            const { maxFeePerGas, maxPriorityFeePerGas } = await getPollGasParams(
+              primaryWalletCoordinator.client,
+              prebuilt,
+            );
+            try {
+              await preSigner.presign(
+                prebuilt.borrower,
+                prebuilt.marketId,
+                TxCache.encodeCalldata(prebuilt),
+                nonce,
+                POLL_GAS_LIMIT,
+                maxFeePerGas,
+                maxPriorityFeePerGas,
+              );
+            } catch (error) {
+              primaryWalletCoordinator.releaseReservedNonce(nonce);
+              throw error;
+            }
+          }
+        : undefined,
+    });
+    const stopMorphoWatcher = startMorphoEventWatcher({
+      chainId: config.chainId,
+      logTag,
+      publicClient,
+      wsPublicClient,
+      morphoAddress: MORPHO_BLUE,
+      onMarketPositionEvent: (marketId, borrower) => {
+        preSigner.invalidate(borrower, marketId);
+        void txCache.rebuildOne(borrower, marketId);
+      },
+      onLiquidateEvent: (log) => void competitorIntel.recordLiquidateEvent(log),
     });
 
     // NONCE MANAGER — pre-warm secondary wallets only. wallet[0] is owned by
@@ -242,45 +338,89 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     // 2. Event-driven: when Flashblock detects >1% price move (instant freshness when it matters)
     let lastTxCacheRefreshMs = 0;
     const TX_CACHE_COOLDOWN_MS = 60_000; // Don't rebuild more than once per minute
-    const refreshTxCache = (trigger?: string) => {
+    const refreshTxCache = async (trigger?: string, force = false): Promise<void> => {
       const now = Date.now();
-      if (now - lastTxCacheRefreshMs < TX_CACHE_COOLDOWN_MS) return;
+      if (!force && now - lastTxCacheRefreshMs < TX_CACHE_COOLDOWN_MS) return;
       lastTxCacheRefreshMs = now;
       const candidates = positionCache.findNearLiquidation(1.05);
-      if (candidates.length > 0) {
-        const positions = candidates.map((c) => c.position);
-        txCache
-          .build(positions)
-          .then(() => {
-            walletEntries.forEach((w, i) => {
-              if (i !== 0)
-                nonceManager.preWarm(w.client, i).catch((e: unknown) => {
-                  console.error("[nonce-prewarm]", e instanceof Error ? e.message : e);
-                });
+      if (candidates.length === 0) return;
+
+      const positions = candidates.map((c) => c.position);
+      try {
+        await txCache.build(positions);
+        walletEntries.forEach((w, i) => {
+          if (i !== 0)
+            nonceManager.preWarm(w.client, i).catch((e: unknown) => {
+              console.error("[nonce-prewarm]", e instanceof Error ? e.message : e);
             });
-          })
-          .catch((err: unknown) => {
-            console.error(
-              `${logTag}TxCache build error:`,
-              err instanceof Error ? err.message : err,
-            );
-          });
+        });
         if (trigger) {
           console.log(`${logTag}TxCache: event-driven refresh (${trigger})`);
         }
+      } catch (err: unknown) {
+        console.error(`${logTag}TxCache build error:`, err instanceof Error ? err.message : err);
       }
     };
+    const refreshState = async (trigger: string): Promise<void> => {
+      try {
+        await positionCache.forceRefresh();
+      } catch (err) {
+        console.error(
+          `${logTag}[POLL] positionCache.forceRefresh error:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+      await refreshTxCache(trigger, true /* force — bypass cooldown */);
+    };
     setTimeout(() => {
-      refreshTxCache();
+      void refreshTxCache();
     }, 10_000);
     setInterval(() => {
-      refreshTxCache();
-    }, 10 * 60_000); // 10분 주기 (was 30min)
+      void refreshTxCache();
+    }, 10 * 60_000); // 10-min fallback: event-driven (Sprint 43) covers state changes, but WS disconnect or missed Morpho log requires periodic full sweep. 30min was too long for crash scenarios — $$ lost during silent window.
+
+    // TEST/HARNESS ONLY: polling trigger for markets that do not emit OCR2
+    // aggregator updates into FlashblockWatcher. The hard env+chain gate keeps
+    // production behavior unchanged until this path is validated.
+    let pollHandle: { interval: ReturnType<typeof setInterval>; stop: () => void } | null = null;
+    if (harnessPollEnabled) {
+      pollHandle =
+        startPollLiquidationTrigger({
+          chainId: config.chainId,
+          logTag,
+          positionCache,
+          txCache,
+          primaryWalletCoordinator,
+          publicClient,
+          wsPublicClient,
+          preSigner,
+          shadowLogger,
+          // HARNESS: on MockOracle PriceUpdated, refresh PositionCache (DIRECT+API)
+          // then rebuild TxCache so the now-underwater custom market position has
+          // calldata ready when runTick fires moments later.
+          onOraclePriceChange: () => refreshState("MockOracle.PriceUpdated"),
+          onAttemptSubmitted: () => refreshState("POLL.submitSuccess"),
+        }) ?? null;
+    }
+
+    // GRACEFUL SHUTDOWN — clean up WS subscriptions and polling intervals.
+    const shutdown = () => {
+      console.log(`${logTag}Graceful shutdown: stopping watchers`);
+      stopMorphoWatcher();
+      pollHandle?.stop();
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
 
     // Track in-flight liquidation attempts for the CEX Predictor path
     const inFlightBorrowersCex = new Set<string>();
     // Will be set when FlashblockHandler is created (if L2 bidding is enabled)
     let flashblockHandler: FlashblockHandler | null = null;
+    const meetsPredictorMinBorrow = (borrowAssets: bigint, loanDecimals: number): boolean => {
+      const defaultMinBorrow = loanDecimals <= 8 ? MIN_BORROW_USDC_6DEC : MIN_BORROW_WETH_18DEC;
+      const minBorrow = getMinBorrowUsdc6Dec(config.chainId, defaultMinBorrow);
+      return borrowAssets >= minBorrow;
+    };
 
     const predictor = new CexPredictor(logTag, (crossings: ThresholdCrossing[]) => {
       if (crossings.length === 0) return;
@@ -301,29 +441,331 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
           `crossed trigger $${top.threshold.triggerCexPrice.toFixed(2)} (${top.dropPercent.toFixed(2)}% below) — ` +
           `${crossings.length} positions at risk`,
       );
+      void (async () => {
+        // Sprint 51b: cex-presign timer wrapping the presign batch loop.
+        const cexPresignTimer = createEventTimer("cex-presign", undefined, {
+          cexPair: top.threshold.collateralSymbol,
+          cexPrice: top.currentCexPrice,
+        });
+        cexPresignTimer.setHandlerDispatch();
+        try {
+          const affectedMarketIds = new Set(
+            crossings.map((crossing) => crossing.threshold.marketId.toLowerCase()),
+          );
+          const presignCandidates = positionCache
+            .findNearLiquidation(1.05)
+            .filter((candidate) => {
+              if (!affectedMarketIds.has(candidate.position.marketId.toLowerCase())) return false;
+              return meetsPredictorMinBorrow(
+                candidate.borrowAssets,
+                candidate.position.loanDecimals,
+              );
+            })
+            .slice(0, 3);
+
+          if (presignCandidates.length === 0) return;
+
+          for (const candidate of presignCandidates) {
+            cexPresignTimer.addCandidate({
+              borrower: candidate.position.borrower,
+              marketId: candidate.position.marketId,
+              collateralSymbol: candidate.position.collateralSymbol,
+            });
+          }
+
+          const results = await Promise.allSettled(
+            presignCandidates.map(async (candidate) => {
+              const { borrower, marketId } = candidate.position;
+              const prebuilt = txCache.get(borrower, marketId);
+              if (prebuilt === undefined) {
+                cexPresignTimer.setSkipped(
+                  { borrower, marketId, collateralSymbol: candidate.position.collateralSymbol },
+                  "no-cache",
+                );
+                return;
+              }
+
+              cexPresignTimer.setCalldataReady({
+                borrower,
+                marketId,
+                collateralSymbol: candidate.position.collateralSymbol,
+              });
+
+              const { maxFeePerGas, maxPriorityFeePerGas } = await getPollGasParams(
+                primaryWalletCoordinator.client,
+                prebuilt,
+              );
+              const nonce = await primaryWalletCoordinator.reserveNonce(
+                `cex-presign:${borrower.toLowerCase()}:${marketId}`,
+                30_000,
+              );
+              let signedTx: Hex;
+              try {
+                signedTx = await preSigner.presign(
+                  borrower,
+                  marketId,
+                  TxCache.encodeCalldata(prebuilt),
+                  nonce,
+                  POLL_GAS_LIMIT,
+                  maxFeePerGas,
+                  maxPriorityFeePerGas,
+                );
+              } catch (error) {
+                primaryWalletCoordinator.releaseReservedNonce(nonce);
+                throw error;
+              }
+              cexPresignTimer.setSignComplete(
+                { borrower, marketId, collateralSymbol: candidate.position.collateralSymbol },
+                false,
+              );
+              cexPresignTimer.setWouldSubmit({
+                borrower,
+                marketId,
+                collateralSymbol: candidate.position.collateralSymbol,
+              });
+              console.log(`${logTag}CEX→PreSigner: cached+submitting signed tx for ${borrower}`);
+              // ARM #1: submit immediately after presign; consume nonce so cex-direct won't double-submit.
+              if (primaryWalletCoordinator.consumeReservedNonce(nonce)) {
+                parallelSubmitter
+                  .send(signedTx)
+                  .then((result) => {
+                    if (result.rpcStatus !== "accepted") {
+                      primaryWalletCoordinator.resetNonceCacheForExternalSubmit();
+                      throw new Error(result.errorMessage ?? `submit rejected via ${result.path}`);
+                    }
+                    preSigner.invalidate(borrower, marketId);
+                    primaryWalletCoordinator.resetNonceCacheForExternalSubmit();
+                    shadowLogger.recordAttempt({
+                      borrower,
+                      marketId,
+                      collateralSymbol: candidate.position.collateralSymbol,
+                      loanSymbol: candidate.position.loanSymbol ?? "",
+                      ourTxHash: result.txHash,
+                      ourTipWei: maxPriorityFeePerGas,
+                      ourMaxFeePerGasWei: maxFeePerGas,
+                      ourSentBlock: 0n,
+                      ourSentMs: Date.now(),
+                      expectedProfitUsd: estimateLiquidationProfitUsd(
+                        candidate.position.loanDecimals <= 8
+                          ? Number(candidate.borrowAssets) / 1e6
+                          : 0,
+                        candidate.position.lltv,
+                      ),
+                    });
+                    console.log(
+                      `${logTag}CEX→PreSigner ARM#1: submitted tx=${result.txHash} via ${result.path}`,
+                    );
+                  })
+                  .catch((e: unknown) => {
+                    primaryWalletCoordinator.resetNonceCacheForExternalSubmit();
+                    console.error(
+                      `${logTag}CEX→PreSigner ARM#1 submit error:`,
+                      e instanceof Error ? e.message : e,
+                    );
+                  });
+              }
+            }),
+          );
+
+          results.forEach((result) => {
+            if (result.status === "rejected") {
+              console.error(
+                `${logTag}CEX→PreSigner error:`,
+                result.reason instanceof Error ? result.reason.message : result.reason,
+              );
+            }
+          });
+        } catch (error: unknown) {
+          console.error(
+            `${logTag}CEX→PreSigner error:`,
+            error instanceof Error ? error.message : error,
+          );
+        } finally {
+          // Sprint 51b: flush all presign candidates.
+          cexPresignTimer.flush();
+        }
+      })();
       // Fast-path: attempt liquidation on near-liquidation positions
       // Apply same filters as Flashblock path to avoid unprofitable/unsupported liquidations.
       const candidates = positionCache.findNearLiquidation().filter((c) => {
         if (SKIP_SYMBOLS.has(c.position.collateralSymbol.toLowerCase())) return false;
-        const minBorrow =
-          c.position.loanDecimals <= 8 ? MIN_BORROW_USDC_6DEC : MIN_BORROW_WETH_18DEC;
-        return c.borrowAssets >= minBorrow;
+        return meetsPredictorMinBorrow(c.borrowAssets, c.position.loanDecimals);
       });
       if (candidates.length > 0) {
+        // Sprint 51b: cex-direct timer for the fastLiquidate submission path.
+        const cexDirectTimer = createEventTimer("cex-direct", undefined, {
+          cexPair: top.threshold.collateralSymbol,
+          cexPrice: top.currentCexPrice,
+        });
+        cexDirectTimer.setHandlerDispatch();
+        for (const candidate of candidates.slice(0, 5)) {
+          cexDirectTimer.addCandidate({
+            borrower: candidate.position.borrower,
+            marketId: candidate.position.marketId,
+            collateralSymbol: candidate.position.collateralSymbol,
+          });
+        }
         for (const candidate of candidates.slice(0, 5)) {
           const borrowerKey = candidate.position.borrower.toLowerCase();
-          if (inFlightBorrowersCex.has(borrowerKey)) continue;
+          if (inFlightBorrowersCex.has(borrowerKey)) {
+            cexDirectTimer.setSkipped(
+              {
+                borrower: candidate.position.borrower,
+                marketId: candidate.position.marketId,
+                collateralSymbol: candidate.position.collateralSymbol,
+              },
+              "in-flight",
+            );
+            continue;
+          }
           inFlightBorrowersCex.add(borrowerKey);
-          bot
-            .fastLiquidate(candidate.position, candidate.seizableCollateral, candidate.borrowAssets)
-            .catch((e: unknown) => {
-              console.error(
-                `${logTag}CEX fast liquidate error:`,
-                e instanceof Error ? e.message : e,
-              );
-            })
-            .finally(() => inFlightBorrowersCex.delete(borrowerKey));
+          cexDirectTimer.setWouldSubmit({
+            borrower: candidate.position.borrower,
+            marketId: candidate.position.marketId,
+            collateralSymbol: candidate.position.collateralSymbol,
+          });
+          const cachedSignedTx = preSigner.get(
+            candidate.position.borrower,
+            candidate.position.marketId,
+          );
+          if (
+            cachedSignedTx !== undefined &&
+            primaryWalletCoordinator.consumeReservedNonce(cachedSignedTx.nonce)
+          ) {
+            parallelSubmitter
+              .send(cachedSignedTx.signedTx)
+              .then((result) => {
+                if (result.rpcStatus !== "accepted") {
+                  primaryWalletCoordinator.resetNonceCacheForExternalSubmit();
+                  throw new Error(result.errorMessage ?? `submit rejected via ${result.path}`);
+                }
+                preSigner.invalidate(candidate.position.borrower, candidate.position.marketId);
+                shadowLogger.recordAttempt({
+                  borrower: candidate.position.borrower,
+                  marketId: candidate.position.marketId,
+                  collateralSymbol: candidate.position.collateralSymbol,
+                  loanSymbol: candidate.position.loanSymbol ?? "",
+                  ourTxHash: result.txHash,
+                  ourTipWei: cachedSignedTx.maxPriorityFeePerGas,
+                  ourMaxFeePerGasWei: cachedSignedTx.maxFeePerGas,
+                  ourSentBlock: 0n,
+                  ourSentMs: Date.now(),
+                  expectedProfitUsd: estimateLiquidationProfitUsd(
+                    candidate.position.loanDecimals <= 8 ? Number(candidate.borrowAssets) / 1e6 : 0,
+                    candidate.position.lltv,
+                  ),
+                });
+                console.log(
+                  `${logTag}CEX→ParallelSubmitter: submitted presigned tx=${result.txHash} via ${result.path}`,
+                );
+              })
+              .catch((e: unknown) => {
+                primaryWalletCoordinator.resetNonceCacheForExternalSubmit();
+                console.error(
+                  `${logTag}CEX presigned submit error:`,
+                  e instanceof Error ? e.message : e,
+                );
+              })
+              .finally(() => inFlightBorrowersCex.delete(borrowerKey));
+            continue;
+          }
+          // ARM #2: cold fallback — try parallelSubmitter with fresh sign first; fastLiquidate is last resort.
+          const coldPrebuilt = txCache.get(
+            candidate.position.borrower,
+            candidate.position.marketId,
+          );
+          if (coldPrebuilt !== undefined) {
+            void (async () => {
+              try {
+                const { maxFeePerGas: coldMaxFee, maxPriorityFeePerGas: coldMaxTip } =
+                  await getPollGasParams(primaryWalletCoordinator.client, coldPrebuilt);
+                const coldNonce = await primaryWalletCoordinator.reserveNonce(
+                  `cex-cold:${candidate.position.borrower.toLowerCase()}:${candidate.position.marketId}`,
+                  15_000,
+                );
+                let coldSignedTx: Hex;
+                try {
+                  coldSignedTx = await preSigner.presign(
+                    candidate.position.borrower,
+                    candidate.position.marketId,
+                    TxCache.encodeCalldata(coldPrebuilt),
+                    coldNonce,
+                    POLL_GAS_LIMIT,
+                    coldMaxFee,
+                    coldMaxTip,
+                  );
+                } catch (signErr) {
+                  primaryWalletCoordinator.releaseReservedNonce(coldNonce);
+                  throw signErr;
+                }
+                if (!primaryWalletCoordinator.consumeReservedNonce(coldNonce)) {
+                  throw new Error("cold nonce already consumed");
+                }
+                const coldResult = await parallelSubmitter.send(coldSignedTx);
+                if (coldResult.rpcStatus !== "accepted") {
+                  primaryWalletCoordinator.resetNonceCacheForExternalSubmit();
+                  throw new Error(
+                    coldResult.errorMessage ?? `cold submit rejected via ${coldResult.path}`,
+                  );
+                }
+                preSigner.invalidate(candidate.position.borrower, candidate.position.marketId);
+                primaryWalletCoordinator.resetNonceCacheForExternalSubmit();
+                shadowLogger.recordAttempt({
+                  borrower: candidate.position.borrower,
+                  marketId: candidate.position.marketId,
+                  collateralSymbol: candidate.position.collateralSymbol,
+                  loanSymbol: candidate.position.loanSymbol ?? "",
+                  ourTxHash: coldResult.txHash,
+                  ourTipWei: coldMaxTip,
+                  ourMaxFeePerGasWei: coldMaxFee,
+                  ourSentBlock: 0n,
+                  ourSentMs: Date.now(),
+                  expectedProfitUsd: estimateLiquidationProfitUsd(
+                    candidate.position.loanDecimals <= 8 ? Number(candidate.borrowAssets) / 1e6 : 0,
+                    candidate.position.lltv,
+                  ),
+                });
+                console.log(
+                  `${logTag}CEX ARM#2 cold submit: tx=${coldResult.txHash} via ${coldResult.path}`,
+                );
+              } catch (coldErr: unknown) {
+                console.error(
+                  `${logTag}CEX ARM#2 cold submit failed, falling back to fastLiquidate:`,
+                  coldErr instanceof Error ? coldErr.message : coldErr,
+                );
+                await bot
+                  .fastLiquidate(
+                    candidate.position,
+                    candidate.seizableCollateral,
+                    candidate.borrowAssets,
+                  )
+                  .catch((e: unknown) => {
+                    console.error(
+                      `${logTag}CEX fast liquidate error:`,
+                      e instanceof Error ? e.message : e,
+                    );
+                  });
+              } finally {
+                inFlightBorrowersCex.delete(borrowerKey);
+              }
+            })();
+          } else {
+            bot
+              .fastLiquidate(
+                candidate.position,
+                candidate.seizableCollateral,
+                candidate.borrowAssets,
+              )
+              .catch((e: unknown) => {
+                console.error(
+                  `${logTag}CEX fast liquidate error:`,
+                  e instanceof Error ? e.message : e,
+                );
+              })
+              .finally(() => inFlightBorrowersCex.delete(borrowerKey));
+          }
         }
+        cexDirectTimer.flush();
       } else {
         // No near-liquidation positions cached — skip.
         // bot.run() was here as fallback but costs 50K CU per call.
@@ -460,17 +902,21 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
         primaryWalletCoordinator,
         canary,
         shadowLogger,
+        preSigner,
+        config.pendingPrewarmFeeds,
       );
 
       // Wire event-driven TxCache refresh to the handler
-      flashblockHandler.onSignificantPriceMove = refreshTxCache;
+      flashblockHandler.onSignificantPriceMove = (trigger: string) => {
+        void refreshTxCache(trigger);
+      };
 
       // Wire flash crash detection → immediate PositionCache + TxCache reload
       flashblockHandler.onFlashCrashDetected = () => {
         console.log(`${logTag}🚨 Flash crash: reloading PositionCache + TxCache immediately`);
         positionCache.reload(); // immediate API fetch, no interval duplication
         setTimeout(() => {
-          refreshTxCache();
+          void refreshTxCache();
         }, 3_000); // rebuild TxCache 3s after cache refresh
       };
 
@@ -572,7 +1018,7 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
 
   // AUTO-REFUEL: convert USDC profits → ETH gas when balance is low.
   // Only on Base (L2 gas is cheap, swap is cheap). ETH L1 gas refuel is manual.
-  if (config.chainId === 8453) {
+  if (config.chainId === 8453 && process.env.SHADOW_ONLY !== "true") {
     // Flash-loan architecture: the wallet only holds gas money. Reserve is
     // `700K gas * maxFeePerGas`, which we cap at 5 gwei (whale tier) → 0.0035 ETH.
     // Refuel target covers ~2 whale TXs back-to-back before the next 30-min tick.
@@ -589,6 +1035,8 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
       autoRefuel.addWallet(entry.client, walletEntries.indexOf(entry));
     }
     autoRefuel.start();
+  } else if (config.chainId === 8453) {
+    console.log(`${logTag}AutoRefuel disabled in shadow-only mode`);
   }
 
   // Discord startup notification

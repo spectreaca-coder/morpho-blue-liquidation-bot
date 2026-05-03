@@ -13,7 +13,10 @@
  *   proxy address when calling `findLiquidatable`.
  */
 
-import { type Address, type Hex } from "viem";
+import { type Address, type Chain, type Client, type Hex, type Transport } from "viem";
+
+import { fetchDirectPositions, getDirectPositionTargets } from "./utils/direct-position-reader.js";
+import { getPositionCacheHfFloor } from "./utils/harness-filter-bypass.js";
 
 // Fixed-point constants matching Morpho Blue's on-chain math
 const WAD = 10n ** 18n;
@@ -138,13 +141,21 @@ export class PositionCache {
   private readonly chainId: number;
   private readonly marketIds: string[];
   private refreshInterval: ReturnType<typeof setInterval> | null = null;
+  /** Optional public client for direct on-chain reads (harness only). */
+  private readonly publicClient: Client<Transport, Chain> | undefined;
 
-  constructor(logTag: string, chainId: number, marketIds?: string[]) {
+  constructor(
+    logTag: string,
+    chainId: number,
+    marketIds?: string[],
+    publicClient?: Client<Transport, Chain>,
+  ) {
     this.logTag = logTag;
     this.chainId = chainId;
     // Empty array = query ALL markets on this chain (auto-discovers wrsETH, new markets, etc.)
     // Specific IDs = restrict to those markets only.
     this.marketIds = marketIds ?? [];
+    this.publicClient = publicClient;
   }
 
   /**
@@ -303,6 +314,34 @@ export class PositionCache {
   }
 
   /**
+   * Return the cached position for an exact borrower/market pair, if present.
+   */
+  findByBorrowerAndMarket(borrower: Address, marketId: Hex): LiquidatablePosition | undefined {
+    const borrowerKey = borrower.toLowerCase();
+    const marketKey = marketId.toLowerCase();
+
+    for (const pos of this.positions) {
+      if (pos.borrower.toLowerCase() !== borrowerKey || pos.marketId.toLowerCase() !== marketKey) {
+        continue;
+      }
+
+      const borrowAssets = toBorrowAssets(
+        pos.borrowShares,
+        pos.totalBorrowAssets,
+        pos.totalBorrowShares,
+      );
+      return {
+        position: pos,
+        healthFactor: WAD,
+        borrowAssets,
+        seizableCollateral: pos.collateral > 0n ? pos.collateral - 1n : 0n,
+      };
+    }
+
+    return undefined;
+  }
+
+  /**
    * Return ALL cached positions as liquidation candidates (no oracle filter).
    * Used when an oracle transmitter TX is detected but we don't know which
    * specific oracle was updated. Caller must simulate to verify.
@@ -391,6 +430,16 @@ export class PositionCache {
     return results;
   }
 
+  /**
+   * HARNESS/EVENT-DRIVEN: force an immediate re-fetch of positions (API + DIRECT).
+   * Production path still uses the `start(intervalMs)` timer.  Use sparingly —
+   * bypasses the normal cadence.  Returns a promise so callers can await or
+   * fire-and-forget.
+   */
+  async forceRefresh(): Promise<void> {
+    await this.loadPositions();
+  }
+
   /** Fetch at-risk positions (HF 0.5–1.15) from the Morpho Blue GraphQL API.
    *  If marketIds were provided, filters to those markets only.
    *  Otherwise queries ALL markets on the chain (auto-discovers new markets). */
@@ -406,7 +455,7 @@ export class PositionCache {
             where: {
               chainId_in: [${this.chainId}],
               ${marketFilter}
-              healthFactor_gte: 0.5,
+              healthFactor_gte: ${getPositionCacheHfFloor(this.chainId, 0.5)},
               healthFactor_lte: 1.30,
               borrowShares_gte: 1
             },
@@ -467,7 +516,7 @@ export class PositionCache {
 
       const items = data.data?.marketPositions?.items ?? [];
 
-      const newPositions: CachedPosition[] = [];
+      let newPositions: CachedPosition[] = [];
 
       for (const item of items) {
         const collateral = BigInt(item.collateral || "0");
@@ -499,22 +548,46 @@ export class PositionCache {
         });
       }
 
-      if (newPositions.length > 0) {
-        this.positions = newPositions;
-        console.log(`${this.logTag}PositionCache: loaded ${newPositions.length} at-risk positions`);
+      // Integrate direct on-chain reads (env-gated, no-op in production)
+      const directTargets = getDirectPositionTargets(this.chainId);
+      if (directTargets.length > 0 && this.publicClient !== undefined) {
         try {
-          const hs = (globalThis as { __healthState?: Record<string, unknown> }).__healthState;
-          if (hs) {
-            hs.positionCacheCount = newPositions.length;
-            hs.positionCacheLastUpdateMs = Date.now();
-          }
-        } catch {
-          // Ignore health-state wiring failures.
+          const directPositions = await fetchDirectPositions({
+            logTag: this.logTag,
+            chainId: this.chainId,
+            client: this.publicClient,
+            targets: directTargets,
+          });
+          // Dedupe by `borrower:marketId` — direct on-chain read wins over API
+          const seen = new Set(
+            directPositions.map((p) => `${p.borrower.toLowerCase()}:${p.marketId.toLowerCase()}`),
+          );
+          const apiOnly = newPositions.filter(
+            (p) => !seen.has(`${p.borrower.toLowerCase()}:${p.marketId.toLowerCase()}`),
+          );
+          newPositions = [...directPositions, ...apiOnly];
+          console.log(
+            `${this.logTag}[DIRECT] merged ${directPositions.length} on-chain positions (API had ${apiOnly.length})`,
+          );
+        } catch (err) {
+          console.error(
+            `${this.logTag}[DIRECT] read failed:`,
+            err instanceof Error ? err.message : err,
+          );
+          // Fall through — API positions alone, no crash
         }
-      } else {
-        console.log(
-          `${this.logTag}PositionCache: 0 at-risk positions (API returned ${items.length} items, ${items.length - newPositions.length} filtered out); preserving ${this.positions.length} cached positions`,
-        );
+      }
+
+      this.positions = newPositions;
+      console.log(`${this.logTag}PositionCache: loaded ${newPositions.length} at-risk positions`);
+      try {
+        const hs = (globalThis as { __healthState?: Record<string, unknown> }).__healthState;
+        if (hs) {
+          hs.positionCacheCount = newPositions.length;
+          hs.positionCacheLastUpdateMs = Date.now();
+        }
+      } catch {
+        // Ignore health-state wiring failures.
       }
     } catch (err) {
       console.error(
