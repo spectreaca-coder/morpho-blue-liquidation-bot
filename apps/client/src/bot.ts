@@ -4,6 +4,7 @@ import {
   estimateUniswapV3MaxSwapIn,
   type UniswapV3PoolSnapshot,
   LiquidityVenue,
+  UniswapV3Venue,
 } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
 import {
@@ -61,6 +62,7 @@ import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
 import { resolveShareLiquidationPlan } from "./utils/morphoLiquidation.js";
 import { MultiBuilderSubmitter } from "./utils/multiBuilder.js";
+import { checkSwapQuoteGate } from "./utils/swapQuoter.js";
 import { isShadowMode, submitOrShadow } from "./utils/txSubmitter.js";
 
 const CBXRP_FAST_PATH_SEIZE_BPS = 500n;
@@ -90,6 +92,14 @@ export interface LiquidationBotInputs {
   shadowLogger?: ShadowLogger;
   /** Phase 2 canary gate. Optional; when absent, all attempts pass through. */
   canary?: CanaryTracker;
+  /**
+   * Optimistic-fastpath quote-gate. When enabled, fastLiquidateWithLease runs
+   * a UniswapV3 quoter check after route conversion to block submissions whose
+   * swap output cannot clear repaidAssets × (1 + bufferBps). Mirrors the
+   * tx-cache quote-gate so OPTIMISTIC SENT TXs no longer bypass it.
+   */
+  quoteGateEnabled?: boolean;
+  quoteGateBufferBps?: number;
 }
 
 export class LiquidationBot {
@@ -141,6 +151,9 @@ export class LiquidationBot {
   private positionOnChainRevertCount = new Map<string, number>();
   private static readonly REVERT_HARD_STOP_THRESHOLD = 3;
 
+  private readonly quoteGateEnabled: boolean;
+  private readonly quoteGateBufferBps: number;
+
   constructor(inputs: LiquidationBotInputs) {
     this.logTag = inputs.logTag;
     this.chainId = inputs.chainId;
@@ -164,6 +177,8 @@ export class LiquidationBot {
     this.primaryWalletCoordinator = inputs.primaryWalletCoordinator;
     this.shadowLogger = inputs.shadowLogger;
     this.canary = inputs.canary;
+    this.quoteGateEnabled = inputs.quoteGateEnabled ?? true;
+    this.quoteGateBufferBps = inputs.quoteGateBufferBps ?? 500;
     if (inputs.flashbotAccount && inputs.chainId === 1) {
       this.multiBuilder = new MultiBuilderSubmitter(inputs.flashbotAccount, inputs.chainId);
     }
@@ -313,6 +328,45 @@ export class LiquidationBot {
       return false;
     }
     const collateralToLoanCalls = encoder.flush();
+
+    // Step 1b: Quote-gate parity with tx-cache.
+    // The OPTIMISTIC fast-path previously bypassed quote-gate entirely, letting
+    // bad-debt / underwater positions burn gas on guaranteed-revert submissions
+    // (e.g. wrsETH/0xFA6Cf4c4 — 4× revert observed 2026-05-04). Gate is only
+    // applied when (a) UniswapV3Venue is registered and supports the pair, and
+    // (b) the market is not the cbXRP pool-aware path (its repaidShares cap
+    // legitimately yields a partial seize that the gate would mis-block).
+    if (this.quoteGateEnabled && pos.collateralSymbol !== "cbXRP") {
+      const uniswapV3Venue = this.liquidityVenues.find(
+        (v): v is UniswapV3Venue => v instanceof UniswapV3Venue,
+      );
+      const supportsRoute =
+        uniswapV3Venue !== undefined
+          ? await uniswapV3Venue.supportsRoute(
+              encoder,
+              getAddress(marketParams.collateralToken),
+              getAddress(marketParams.loanToken),
+            )
+          : false;
+      if (uniswapV3Venue !== undefined && supportsRoute) {
+        const requiredOut =
+          (liquidationPlan.repaidAssets * BigInt(10_000 + this.quoteGateBufferBps)) / 10_000n;
+        const gateResult = await checkSwapQuoteGate({
+          client: this.client,
+          collateralToken: getAddress(marketParams.collateralToken),
+          loanToken: getAddress(marketParams.loanToken),
+          seizedAssets: liquidationPlan.seizedAssets,
+          requiredOut,
+          logTag: this.logTag,
+          marketId,
+          borrower: pos.borrower,
+        });
+        if (!gateResult.pass) {
+          this.markPositionUsed(marketId, pos.borrower);
+          return false;
+        }
+      }
+    }
 
     // Step 2: Repay amount based on predicted repaidAssets (not full borrowAssets)
     const repayAmount = (liquidationPlan.repaidAssets * 101n) / 100n;

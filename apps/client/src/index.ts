@@ -254,6 +254,8 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     useL2PriorityBidding: config.useL2PriorityBidding,
     primaryWalletCoordinator,
     canary,
+    quoteGateEnabled: config.quoteGateEnabled,
+    quoteGateBufferBps: config.quoteGateBufferBps,
   };
 
   const bot = new LiquidationBot(inputs);
