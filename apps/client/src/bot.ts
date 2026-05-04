@@ -452,6 +452,7 @@ export class LiquidationBot {
               writeContract(this.client, {
                 address: encoder.address,
                 ...functionData,
+                gas: 700_000n,
                 maxPriorityFeePerGas: dynamicTip,
                 maxFeePerGas: dynamicMaxFee,
                 nonce,
@@ -604,6 +605,7 @@ export class LiquidationBot {
               writeContract(this.client, {
                 address: encoder.address,
                 ...functionData,
+                gas: 700_000n,
                 nonce,
                 maxFeePerGas: SIMPLE_PATH_MAX_FEE_PER_GAS,
                 maxPriorityFeePerGas: SIMPLE_PATH_MAX_PRIORITY_FEE_PER_GAS,
@@ -1162,6 +1164,7 @@ export class LiquidationBot {
               writeContract(this.client, {
                 address: encoder.address,
                 ...functionData,
+                gas: 700_000n,
                 maxPriorityFeePerGas: effectivePriorityFee,
                 maxFeePerGas,
                 nonce,
@@ -1221,6 +1224,7 @@ export class LiquidationBot {
               writeContract(this.client, {
                 address: encoder.address,
                 ...functionData,
+                gas: 700_000n,
                 nonce,
                 maxFeePerGas: SIMPLE_PATH_MAX_FEE_PER_GAS,
                 maxPriorityFeePerGas: SIMPLE_PATH_MAX_PRIORITY_FEE_PER_GAS,
