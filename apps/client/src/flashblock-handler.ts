@@ -751,11 +751,13 @@ export class FlashblockHandler {
             const dynamicTip = estimatePriorityFeeWei(prebuilt);
             const maxPriorityFeePerGas =
               dynamicTip > floorPriorityFee ? dynamicTip : floorPriorityFee;
-            // Hot-path floor: 2 gwei. Higher than auto-refuel's 0.1 gwei simple-path
-            // floor by design — liquidations are time-critical and need to clear the
-            // Base sequencer queue ahead of competing bots, while refuel txs can wait.
-            // Do NOT unify these constants without re-running competitor analysis.
-            const MAX_FEE_FLOOR = 2_000_000_000n;
+            // Hot-path floor: 1 gwei (lowered 2026-05-04 from 2 gwei to fit bootstrap
+            // wallet balances; W2 0.0013 ETH < 2 gwei × 700K = 0.0014 ETH was failing
+            // every fast-path with "total cost exceeds balance"). Still higher than
+            // auto-refuel's 0.1 gwei because liquidations are time-critical, but 1 gwei
+            // gives 10x headroom over normal Base baseFee (<0.1 gwei). Raise once wallets
+            // are funded above 0.005 ETH and re-run competitor analysis.
+            const MAX_FEE_FLOOR = 1_000_000_000n;
             const dynamicCap =
               baseMaxFeePerGas > maxPriorityFeePerGas
                 ? baseMaxFeePerGas

@@ -417,17 +417,16 @@ export class LiquidationBot {
                 ? 10_000_000n // 0.01 gwei
                 : 5_000_000n; // 0.005 gwei — competitor median baseline
         // EIP-1559: maxFeePerGas must be >= baseFee + priorityFee.
-        // Sprint D1 (2026-04-11) confirmed Base baseFee can spike to 1+ gwei during
-        // congestion, causing rejects with the old per-tier maxFee values (0.2-0.5 gwei).
-        // Fix: unified 2 gwei maxFee across all tiers. This covers baseFee up to ~1.95 gwei
-        // (covers >99% of Base scenarios). Actual cost is still baseFee + tip (refund to
-        // that after landing), so the higher max-fee ceiling is free — it only affects
-        // the pre-send balance check.
+        // Sprint D1 (2026-04-11) raised this to 2 gwei to clear baseFee spikes; comment
+        // claimed wallets had 0.0007+ ETH and 2 gwei × 250K = 0.0005 ETH would pass.
+        // 2026-05-04 reality check: actual gasLimit is ~700K (flash-loan + multi-hop swap),
+        // not 250K. 2 gwei × 700K = 0.0014 ETH, exceeding W2's 0.0013 ETH balance and
+        // causing every fastLiquidate to revert with "total cost exceeds balance".
         //
-        // Wallet balance check: viem requires `balance >= gasLimit * maxFeePerGas`.
-        // At 2 gwei × 250K (upper gas bound) = 0.0005 ETH per TX. All wallets currently
-        // have 0.0007+ ETH, so the check passes.
-        const dynamicMaxFee = 2_000_000_000n; // 2 gwei (unified across tiers)
+        // Lower to 1 gwei: 1 gwei × 700K = 0.0007 ETH, fits within bootstrap balances.
+        // Base baseFee under normal load is <0.1 gwei; 1 gwei still gives 10x headroom.
+        // If congestion-driven rejects reappear, raise once wallets are funded.
+        const dynamicMaxFee = 1_000_000_000n; // 1 gwei (bootstrap-friendly cap)
         const nonce = await this.primaryWalletCoordinator.nextNonce(lease);
         let txHash: Hex;
         const signStartMs = Date.now();
