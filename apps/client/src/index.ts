@@ -170,9 +170,18 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     logger: competitorIntel,
     logTag,
   });
-  console.log(
-    `${logTag}[ParallelSubmitter] enabled paths: alchemy${process.env.BLXR_AUTH_HEADER || process.env.BLOXROUTE_BASE_AUTH ? ", bloxroute" : ""}${process.env.RPC_URL_FALLBACK_8453 ? ", ankr" : ""}`,
-  );
+  // Banner reflects post-construction state of each submitter, not raw env vars.
+  // Previous version checked `process.env.RPC_URL_FALLBACK_8453 ? ", ankr"` but
+  // AnkrSubmitter nullifies its rpcUrl when the URL is the unauthenticated
+  // `rpc.ankr.com/base` endpoint — so the banner could advertise "ankr" while
+  // AnkrSubmitter.send() always returned "disabled". `isEnabled()` introspects
+  // the actual instance state.
+  const enabledPaths = parallelSubmitter
+    .getSubmitters()
+    .filter((s) => s.isEnabled())
+    .map((s) => s.name)
+    .join(", ");
+  console.log(`${logTag}[ParallelSubmitter] enabled paths: ${enabledPaths}`);
 
   // LIQUIDITY VENUES
   const liquidityVenues = config.liquidityVenues.map((liquidityVenueName) =>

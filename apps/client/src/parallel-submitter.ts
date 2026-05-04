@@ -15,6 +15,13 @@ export interface SubmitResult {
 export interface RpcSubmitter {
   name: "alchemy" | "bloxroute" | "ankr";
   send(signedTx: Hex): Promise<SubmitResult>;
+  /**
+   * True iff this submitter has all the configuration needed to actually fire.
+   * Used by the startup banner to report only the paths that will run, instead
+   * of guessing from raw env vars (which could lie — e.g. an Ankr URL that the
+   * submitter then nullifies internally for being unauthenticated).
+   */
+  isEnabled(): boolean;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -40,6 +47,10 @@ export class AlchemySubmitter implements RpcSubmitter {
 
   constructor(publicClient: PublicClient) {
     this.publicClient = publicClient;
+  }
+
+  isEnabled(): boolean {
+    return this.publicClient !== undefined;
   }
 
   async send(signedTx: Hex): Promise<SubmitResult> {
@@ -90,6 +101,10 @@ export class BloxrouteSubmitter implements RpcSubmitter {
     this.endpoint =
       process.env.BLXR_BASE_RPC ?? process.env.BLOXROUTE_BASE_URL ?? "https://api.blxrbdn.com";
     this.authHeader = process.env.BLXR_AUTH_HEADER ?? process.env.BLOXROUTE_BASE_AUTH;
+  }
+
+  isEnabled(): boolean {
+    return this.authHeader !== undefined && this.authHeader.length > 0;
   }
 
   async send(signedTx: Hex): Promise<SubmitResult> {
@@ -176,6 +191,10 @@ export class AnkrSubmitter implements RpcSubmitter {
   constructor() {
     const rawUrl = process.env.RPC_URL_FALLBACK_8453;
     this.rpcUrl = isUnauthenticatedAnkrBaseUrl(rawUrl) ? undefined : rawUrl;
+  }
+
+  isEnabled(): boolean {
+    return this.rpcUrl !== undefined;
   }
 
   async send(signedTx: Hex): Promise<SubmitResult> {

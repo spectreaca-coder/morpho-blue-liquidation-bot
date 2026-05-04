@@ -558,11 +558,19 @@ export class FlashblockWatcher {
     this.alchemyWs = new WS(ALCHEMY_WS_URL);
     this.alchemyWs.on("open", () => {
       console.log(`${this.logTag}AlchemyWatcher: connected`);
+      // No `toAddress` filter — for OCR2 (BTC/USD, ETH/USD, cbBTC, cbETH, XRP,
+      // ADA, LTC) the pending tx's `to` is Chainlink's AuthorizedForwarder, not
+      // the aggregator. Filtering by aggregator address blocks all OCR2 events
+      // at the source. Sprint 48 Phase 2 W2 pending-prewarm was silently no-op
+      // because of this — 0 events in 155K-line OCI log. Fix verified 2026-05-04.
+      // Volume risk is bounded: `detectOracleUpdate` does a cheap selector
+      // string-includes (`6fadcf72`/`c9807539`) before any allocation, so non-
+      // oracle pending TXs are rejected in microseconds.
       const sub = JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
         method: "eth_subscribe",
-        params: ["alchemy_pendingTransactions", { toAddress: aggregatorAddrs, hashesOnly: false }],
+        params: ["alchemy_pendingTransactions", { hashesOnly: false }],
       });
       this.alchemyWs!.send(sub);
     });
@@ -574,9 +582,12 @@ export class FlashblockWatcher {
           return;
         }
         const tx = msg.params?.result;
-        if (!tx?.input || !tx?.to) return;
-        const aggAddr = tx.to.toLowerCase().replace("0x", "");
-        if (!this.aggregators.has(aggAddr)) return;
+        if (!tx?.input) return;
+        // No `tx.to ∈ aggregators` second-gate — that gate excluded OCR2
+        // forwarder TXs (where `tx.to` is the forwarder, not the aggregator).
+        // Defer to `detectOracleUpdate`, which extracts the aggregator address
+        // from the OCR2 calldata at the exact ABI offset and validates against
+        // the aggregator set — that is the precise filter.
         const detected = this.detectOracleUpdate(tx.input);
         if (!detected) return;
         this.onOracleUpdate({
