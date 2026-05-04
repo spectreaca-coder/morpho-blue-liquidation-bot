@@ -45,6 +45,7 @@ import { readContract } from "viem/actions";
 
 import { maxSafeSeize } from "./poolCap.js";
 import { toBorrowAssets, type CachedPosition, type PositionCache } from "./position-cache.js";
+import { quoteAerodromeSlipstreamOut } from "./utils/aerodromeQuoter.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
 import { resolveShareLiquidationPlan } from "./utils/morphoLiquidation.js";
@@ -972,9 +973,10 @@ export class TxCache {
           const oneInchVenue = this.liquidityVenues.find(
             (venue): venue is OneInch => venue instanceof OneInch,
           );
-          const aerodromeEnabled =
-            this.chainId === 8453 &&
-            this.liquidityVenues.some((venue) => venue instanceof AerodromeV3Venue);
+          const aerodromeV3Venue = this.liquidityVenues.find(
+            (v): v is AerodromeV3Venue => v instanceof AerodromeV3Venue,
+          );
+          const aerodromeEnabled = this.chainId === 8453 && aerodromeV3Venue !== undefined;
           const raceResult = await raceClearingSwapQuotes({
             requiredOut,
             probes: [
@@ -994,7 +996,20 @@ export class TxCache {
                   }),
               },
               { venue: "balancer", enabled: false },
-              { venue: "aerodromeV3", enabled: aerodromeEnabled && false },
+              {
+                venue: "aerodromeV3",
+                enabled: aerodromeEnabled,
+                quote: async () =>
+                  quoteAerodromeSlipstreamOut({
+                    client: this.client,
+                    chainId: this.chainId,
+                    collateralToken: winningVenueInput.src,
+                    loanToken: winningVenueInput.dst,
+                    seizedAssets: winningVenueInput.srcAmount,
+                    executorAddress: this.executorAddress,
+                    originAddress: this.client.account.address,
+                  }),
+              },
             ],
           });
           if (raceResult.winnerVenue === null) {
@@ -1012,7 +1027,9 @@ export class TxCache {
               ? oneInchVenue
               : raceResult.winnerVenue === "uniswapV3"
                 ? winningVenue
-                : undefined;
+                : raceResult.winnerVenue === "aerodromeV3"
+                  ? aerodromeV3Venue
+                  : undefined;
           if (selectedVenue === undefined) {
             return null;
           }
