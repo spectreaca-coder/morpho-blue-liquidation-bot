@@ -130,6 +130,17 @@ export class LiquidationBot {
   private gasPriceInFlight: Promise<bigint> | null = null;
   private static readonly GAS_PRICE_CACHE_TTL_MS = 5_000;
 
+  /**
+   * In-memory per-(market,borrower) on-chain-revert counter. Bad-debt positions
+   * that pass the optimistic-L2 quote-gate bypass but revert on-chain (e.g. swap
+   * output << repay amount) keep cycling through the 1-hour cooldown forever,
+   * draining gas. After REVERT_HARD_STOP_THRESHOLD on-chain reverts, hard-skip
+   * the (market, borrower) pair for the rest of this process. Reset by restart.
+   * Counter is incremented inside verifyCanaryReceipt when status === reverted.
+   */
+  private positionOnChainRevertCount = new Map<string, number>();
+  private static readonly REVERT_HARD_STOP_THRESHOLD = 3;
+
   constructor(inputs: LiquidationBotInputs) {
     this.logTag = inputs.logTag;
     this.chainId = inputs.chainId;
@@ -224,6 +235,12 @@ export class LiquidationBot {
 
     const marketId = pos.marketId;
     if (!this.checkCooldown(marketId, pos.borrower)) return false;
+    if (this.isPositionHardSkipped(marketId, pos.borrower)) {
+      console.log(
+        `${this.logTag}Fast skip: hard-stop (>=3 on-chain reverts) ${pos.borrower} ${pos.collateralSymbol}/${pos.loanSymbol}`,
+      );
+      return false;
+    }
 
     const badDebtPosition = seizableCollateral === pos.collateral;
 
@@ -1353,6 +1370,23 @@ export class LiquidationBot {
     this.positionLiquidationCooldownMechanism?.markPositionUsed(marketId, account);
   }
 
+  private isPositionHardSkipped(marketId: Hex, account: Address): boolean {
+    const key = `${marketId.toLowerCase()}:${account.toLowerCase()}`;
+    const count = this.positionOnChainRevertCount.get(key) ?? 0;
+    return count >= LiquidationBot.REVERT_HARD_STOP_THRESHOLD;
+  }
+
+  private recordPositionOnChainRevert(marketId: Hex, account: Address): void {
+    const key = `${marketId.toLowerCase()}:${account.toLowerCase()}`;
+    const count = (this.positionOnChainRevertCount.get(key) ?? 0) + 1;
+    this.positionOnChainRevertCount.set(key, count);
+    if (count === LiquidationBot.REVERT_HARD_STOP_THRESHOLD) {
+      console.log(
+        `${this.logTag}HARD-SKIP: ${count} on-chain reverts for ${account} ${marketId} — suppressing for rest of process`,
+      );
+    }
+  }
+
   private async checkProfit(
     loanAsset: Address,
     loanAssetBalance: {
@@ -1592,6 +1626,9 @@ export class LiquidationBot {
     const gasCostUsd = await this.usdValueFromEthAmount(gasCostWei);
 
     const isSuccess = receipt.status === "success";
+    if (!isSuccess) {
+      this.recordPositionOnChainRevert(ctx.marketId, ctx.borrower);
+    }
     this.canary.recordResult({
       timestamp: nowMs,
       eventDate,
