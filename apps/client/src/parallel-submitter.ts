@@ -41,16 +41,33 @@ function isUnauthenticatedAnkrBaseUrl(rawUrl: string | undefined): boolean {
 // ---------------------------------------------------------------------------
 // AlchemySubmitter — wraps existing publicClient.sendRawTransaction
 // ---------------------------------------------------------------------------
+/** Error messages (lowercase) that indicate the RPC endpoint itself is dead/misconfigured. */
+const ALCHEMY_FATAL_RPC_PATTERNS = [
+  "getaddrinfo enotfound",
+  "econnrefused",
+  "rpc url",
+  "401",
+  "403",
+  "project id",
+  "invalid api key",
+] as const;
+
+function isAlchemyFatalRpcError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return ALCHEMY_FATAL_RPC_PATTERNS.some((p) => lower.includes(p));
+}
+
 export class AlchemySubmitter implements RpcSubmitter {
   readonly name = "alchemy";
   private readonly publicClient: PublicClient;
+  private health = true;
 
   constructor(publicClient: PublicClient) {
     this.publicClient = publicClient;
   }
 
   isEnabled(): boolean {
-    return this.publicClient !== undefined;
+    return this.publicClient !== undefined && this.health;
   }
 
   async send(signedTx: Hex): Promise<SubmitResult> {
@@ -77,13 +94,20 @@ export class AlchemySubmitter implements RpcSubmitter {
         rpcStatus: "accepted",
       };
     } catch (error: unknown) {
+      const msg = getErrorMessage(error);
+      if (isAlchemyFatalRpcError(msg)) {
+        this.health = false;
+        console.error(
+          `[AlchemySubmitter] fatal RPC error — marking unhealthy: ${msg.slice(0, 120)}`,
+        );
+      }
       return {
         path: this.name,
         txHash: "0x",
         submitMs,
         responseMs: Date.now() - submitMs,
         rpcStatus: "error",
-        errorMessage: getErrorMessage(error),
+        errorMessage: msg,
       };
     }
   }

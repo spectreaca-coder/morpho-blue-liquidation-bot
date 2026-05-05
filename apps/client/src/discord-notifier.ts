@@ -33,6 +33,7 @@ export class DiscordNotifier {
   private lastMonthReset = new Date().getMonth();
 
   private async send(content: string): Promise<void> {
+    if (!WEBHOOK_URL) return;
     try {
       await fetch(WEBHOOK_URL, {
         method: "POST",

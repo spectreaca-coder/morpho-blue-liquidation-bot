@@ -79,6 +79,8 @@ export class AutoRefuel {
   private wallets: WalletInfo[] = [];
   private interval: ReturnType<typeof setInterval> | null = null;
   private readonly shadowSkipWarnedWallets = new Set<Address>();
+  private readonly lastUsdcZeroAlertMs = new Map<Address, number>();
+  private static readonly USDC_ZERO_ALERT_COOLDOWN_MS = 24 * 60 * 60_000;
 
   constructor(config: AutoRefuelConfig) {
     this.logTag = config.logTag;
@@ -141,15 +143,30 @@ export class AutoRefuel {
           });
 
           if (usdcBal === 0n) {
-            console.warn(
-              `${this.logTag}AutoRefuel: USDC=0 — cannot refuel low-ETH wallet ${wallet.address}. ETH balance ${formatUnits(ethBal, 18)}. MANUAL FUNDING REQUIRED.`,
-            );
-            discord
-              .notifyError(
-                "AutoRefuel critical",
-                `USDC=0, wallet ${wallet.address} ETH=${formatUnits(ethBal, 18)}`,
-              )
-              .catch(() => {});
+            const now = Date.now();
+            const lastAlert = this.lastUsdcZeroAlertMs.get(wallet.address);
+            if (
+              lastAlert === undefined ||
+              now - lastAlert >= AutoRefuel.USDC_ZERO_ALERT_COOLDOWN_MS
+            ) {
+              console.warn(
+                `${this.logTag}AutoRefuel: USDC=0 — cannot refuel low-ETH wallet ${wallet.address}. ETH balance ${formatUnits(ethBal, 18)}. MANUAL FUNDING REQUIRED.`,
+              );
+              discord
+                .notifyError(
+                  "AutoRefuel critical",
+                  `USDC=0, wallet ${wallet.address} ETH=${formatUnits(ethBal, 18)}`,
+                )
+                .catch(() => {});
+              this.lastUsdcZeroAlertMs.set(wallet.address, now);
+            } else {
+              const remainingHours = Math.ceil(
+                (AutoRefuel.USDC_ZERO_ALERT_COOLDOWN_MS - (now - lastAlert)) / 3_600_000,
+              );
+              console.log(
+                `${this.logTag}AutoRefuel: USDC=0 (suppressed alert, next in ${remainingHours}h) wallet ${wallet.address}`,
+              );
+            }
             continue;
           }
 
