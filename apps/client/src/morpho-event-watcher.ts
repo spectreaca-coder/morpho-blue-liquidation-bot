@@ -58,36 +58,26 @@ function getLiquidatePollIntervalMs(): number {
 }
 
 export function startMorphoEventWatcher(args: StartMorphoEventWatcherArgs): () => void {
-  const {
-    chainId,
-    logTag,
-    publicClient,
-    wsPublicClient,
-    morphoAddress,
-    onMarketPositionEvent,
-    onLiquidateEvent,
-  } = args;
+  const { chainId, logTag, publicClient, morphoAddress, onMarketPositionEvent, onLiquidateEvent } =
+    args;
 
-  const useWs = wsPublicClient !== undefined;
-  const positionEventTransport = useWs ? "WS subscribe" : "HTTP poll 2000ms";
   const liquidatePollIntervalMs = getLiquidatePollIntervalMs();
   const lastErrorLogMsByEvent = new Map<string, number>();
   console.log(
-    `${logTag}MorphoEventWatcher: ${positionEventTransport} (position events) + HTTP poll ${liquidatePollIntervalMs}ms (Liquidate) on chain=${chainId} address=${morphoAddress}`,
+    `${logTag}MorphoEventWatcher: HTTP poll 2000ms (position events) + HTTP poll ${liquidatePollIntervalMs}ms (Liquidate) on chain=${chainId} address=${morphoAddress}`,
   );
 
   const unwatchers = morphoPositionEvents.map(({ eventName, borrowerField }) => {
-    // Liquidate events: always HTTP poll. WS eth_subscribe silently drops events
-    // at high throughput (~50K/day on Base). Dedicated HTTP poll gives full capture.
-    // All other position events: prefer WS push subscription when available.
+    // All events use HTTP poll for reliability. WS eth_subscribe fails at startup on
+    // Base mainnet and silently drops events at high throughput (~50K/day).
+    // HTTP polling is deterministic and avoids "watch error" logs on startup.
     const isLiquidate = eventName === "Liquidate";
-    const client = isLiquidate ? publicClient : useWs ? wsPublicClient : publicClient;
-    const pollForThisEvent = isLiquidate ? true : !useWs;
-    const pollingOpts = pollForThisEvent
-      ? { poll: true as const, pollingInterval: isLiquidate ? liquidatePollIntervalMs : 2_000 }
-      : {};
+    const pollingOpts = {
+      poll: true as const,
+      pollingInterval: isLiquidate ? liquidatePollIntervalMs : 2_000,
+    };
 
-    return watchContractEvent(client, {
+    return watchContractEvent(publicClient, {
       address: morphoAddress,
       abi: morphoBlueAbi,
       eventName,
@@ -117,7 +107,12 @@ export function startMorphoEventWatcher(args: StartMorphoEventWatcherArgs): () =
         }
       },
       onError: (error) => {
-        const message = error instanceof Error ? error.message : String(error);
+        const message =
+          error instanceof Error
+            ? error.message
+            : typeof error === "object" && error !== null && "message" in error
+              ? String((error as { message: unknown }).message)
+              : JSON.stringify(error);
         if (message.includes("429") || message.includes("Too Many Requests")) {
           healthState.errors429Count += 1;
         }

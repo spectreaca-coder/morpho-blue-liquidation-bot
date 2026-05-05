@@ -69,6 +69,7 @@ export class FlashblockWatcher {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private alchemyWs: InstanceType<typeof WS> | null = null;
   private alchemyReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private warnedNoWsUrl = false;
   /** Last message from the **primary flashblock WS** only. Heartbeat watches this so
    *  Alchemy traffic cannot mask a dead flashblock stream. */
   private lastFlashblockMessageMs: number = Date.now();
@@ -552,7 +553,15 @@ export class FlashblockWatcher {
   }
 
   private connectAlchemy(): void {
-    if (!this.isRunning || !ALCHEMY_WS_URL) return;
+    if (!this.isRunning || !ALCHEMY_WS_URL) {
+      if (!ALCHEMY_WS_URL && !this.warnedNoWsUrl) {
+        this.warnedNoWsUrl = true;
+        console.warn(
+          `${this.logTag}AlchemyWatcher: WS_URL_8453 not set — pending-prewarm DISABLED`,
+        );
+      }
+      return;
+    }
     const aggregatorAddrs = Array.from(this.aggregators).map((a) => "0x" + a);
     console.log(`${this.logTag}AlchemyWatcher: connecting (${aggregatorAddrs.length} aggregators)`);
     this.alchemyWs = new WS(ALCHEMY_WS_URL);

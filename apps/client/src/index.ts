@@ -232,6 +232,8 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     if (canary.stopped) {
       console.error(`${logTag}CANARY STOPPED (persistent state): ${canary.stoppedReason}`);
     }
+  } else {
+    console.log(`${logTag}CANARY DISABLED (CANARY_MODE not set)`);
   }
 
   const inputs: LiquidationBotInputs = {

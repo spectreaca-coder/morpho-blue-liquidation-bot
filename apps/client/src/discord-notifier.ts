@@ -4,6 +4,7 @@
  */
 
 const WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
+if (!WEBHOOK_URL) console.warn("[Discord] DISCORD_WEBHOOK_URL not set — notifications silenced");
 
 interface LiquidationResult {
   market: string;

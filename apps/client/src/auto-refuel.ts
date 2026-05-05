@@ -141,10 +141,15 @@ export class AutoRefuel {
           });
 
           if (usdcBal === 0n) {
-            console.log(
-              `${this.logTag}AutoRefuel: wallet[${wallet.index}] ETH low ` +
-                `(${formatUnits(ethBal, 18)}) but USDC balance is 0 — cannot refuel`,
+            console.warn(
+              `${this.logTag}AutoRefuel: USDC=0 — cannot refuel low-ETH wallet ${wallet.address}. ETH balance ${formatUnits(ethBal, 18)}. MANUAL FUNDING REQUIRED.`,
             );
+            discord
+              .notifyError(
+                "AutoRefuel critical",
+                `USDC=0, wallet ${wallet.address} ETH=${formatUnits(ethBal, 18)}`,
+              )
+              .catch(() => {});
             continue;
           }
 
