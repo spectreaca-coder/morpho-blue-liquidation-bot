@@ -1,0 +1,26 @@
+created_utc=2026-05-09T18:40:38Z
+source=/home/ubuntu/morpho-liquidator-v2/logs
+env_included=false
+bot_stopped=true
+8652166705 2026-05-09T18:40:24.7440200890Z /home/ubuntu/morpho-liquidator-v2/logs/bot.log
+1330 2026-05-03T12:58:19.5453250240Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260503_125815.log
+1114541 2026-05-03T20:08:55.9418345060Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260503_130303.log
+777146 2026-05-03T20:48:30.3479058550Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260503_200908.log
+16290854 2026-05-04T06:04:39.7221168760Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260503_204841.log
+165403 2026-05-04T06:14:05.9384786370Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260504_060501.log
+855506 2026-05-04T06:36:48.1929835720Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260504_061410.log
+320646 2026-05-04T06:49:34.7250152460Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260504_063715.log
+472 2026-05-04T06:45:10.4525766170Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260504_064448.log
+472 2026-05-04T06:48:56.5766626650Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260504_064835.log
+14899267 2026-05-04T13:57:14.5712232660Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260504_064954.log
+15808308 2026-05-04T17:08:06.4716638400Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260504_135726.log
+39115792 2026-05-05T17:54:09.8481958380Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260504_170819.log
+908770 2026-05-05T18:30:59.8538604140Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260505_175413.log
+65229434 2026-05-07T13:06:49.3354168630Z /home/ubuntu/morpho-liquidator-v2/logs/bot_deploy_20260505_183103.log
+19018 2026-05-04T16:58:15.2582208350Z /home/ubuntu/morpho-liquidator-v2/logs/canary_results.jsonl
+386 2026-05-04T16:58:15.2582208350Z /home/ubuntu/morpho-liquidator-v2/logs/canary_state.json
+5890 2026-05-07T16:19:39.8457195060Z /home/ubuntu/morpho-liquidator-v2/logs/competitor_intel.jsonl
+12935 2026-05-09T18:27:32.0777546280Z /home/ubuntu/morpho-liquidator-v2/logs/oci_maintenance_20260509T182035Z.txt
+37470 2026-05-07T14:38:55.9422483190Z /home/ubuntu/morpho-liquidator-v2/logs/shadow_events.jsonl
+35386 2026-05-04T16:58:15.2602208540Z /home/ubuntu/morpho-liquidator-v2/logs/shadow_submit_intent.jsonl
+167282106 2026-05-07T20:42:23.2963344000Z /home/ubuntu/morpho-liquidator-v2/logs/submit_attempts.jsonl
